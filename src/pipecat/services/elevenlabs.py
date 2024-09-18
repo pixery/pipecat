@@ -98,6 +98,7 @@ class ElevenLabsTTSService(AsyncWordTTSService):
             model: str = "eleven_turbo_v2_5",
             url: str = "wss://api.elevenlabs.io",
             params: InputParams = InputParams(),
+            optimize_streaming_latency: int = 0,
             **kwargs):
         # Aggregating sentences still gives cleaner-sounding results and fewer
         # artifacts than streaming one word at a time. On average, waiting for a
@@ -128,6 +129,7 @@ class ElevenLabsTTSService(AsyncWordTTSService):
         self._url = url
         self._params = params
         self._sample_rate = sample_rate_from_output_format(params.output_format)
+        self._optimize_streaming_latency = optimize_streaming_latency
 
         # Websocket connection to ElevenLabs.
         self._websocket = None
@@ -180,7 +182,8 @@ class ElevenLabsTTSService(AsyncWordTTSService):
             voice_id = self._voice_id
             model = self._model
             output_format = self._params.output_format
-            url = f"{self._url}/v1/text-to-speech/{voice_id}/stream-input?model_id={model}&output_format={output_format}"
+            optimize_streaming_latency = self._optimize_streaming_latency
+            url = f"{self._url}/v1/text-to-speech/{voice_id}/stream-input?model_id={model}&output_format={output_format}&optimize_streaming_latency={optimize_streaming_latency}"
             self._websocket = await websockets.connect(url)
             self._receive_task = self.get_event_loop().create_task(self._receive_task_handler())
             self._keepalive_task = self.get_event_loop().create_task(self._keepalive_task_handler())
