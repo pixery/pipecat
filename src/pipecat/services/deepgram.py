@@ -133,6 +133,7 @@ class DeepgramSTTService(STTService):
             api_key, config=DeepgramClientOptions(url=url, options={"keepalive": "true"}))
         self._connection: AsyncListenWebSocketClient = self._client.listen.asyncwebsocket.v("1")
         self._connection.on(LiveTranscriptionEvents.Transcript, self._on_message)
+        self._connection.on(LiveTranscriptionEvents.Error, self._on_error)
 
     async def set_model(self, model: str):
         logger.debug(f"Switching STT model to: [{model}]")
@@ -190,3 +191,8 @@ class DeepgramSTTService(STTService):
                 await self.push_frame(TranscriptionFrame(transcript, "", time_now_iso8601(), language))
             else:
                 await self.push_frame(InterimTranscriptionFrame(transcript, "", time_now_iso8601(), language))
+
+    async def _on_error(self, error, **kwargs):
+        logger.error(f"{self}: Deepgram error: {error}")
+        if not self._connection.is_connected:
+            await self._connect()
