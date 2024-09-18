@@ -8,7 +8,7 @@ import asyncio
 import base64
 import json
 
-from typing import Any, AsyncGenerator, List, Literal, Mapping, Tuple
+from typing import Any, AsyncGenerator, List, Literal, Mapping, Tuple, Optional
 from pydantic import BaseModel
 
 from pipecat.frames.frames import (
@@ -68,6 +68,22 @@ def calculate_word_times(
 
     return word_times
 
+class VoiceSettings:
+    stability: Optional[float] = None
+    similarity_boost: Optional[float] = None
+    style: Optional[float] = None
+    use_speaker_boost: Optional[bool] = None
+
+    def to_dict(self) -> dict:
+        return {
+            key: value for key, value in {
+                "stability": self.stability,
+                "similarity_boost": self.similarity_boost,
+                "style": self.style,
+                "use_speaker_boost": self.use_speaker_boost
+            }.items() if value is not None
+        }
+
 
 class ElevenLabsTTSService(AsyncWordTTSService):
     class InputParams(BaseModel):
@@ -78,6 +94,7 @@ class ElevenLabsTTSService(AsyncWordTTSService):
             *,
             api_key: str,
             voice_id: str,
+            voice_settings: Optional[VoiceSettings] = None,
             model: str = "eleven_turbo_v2_5",
             url: str = "wss://api.elevenlabs.io",
             params: InputParams = InputParams(),
@@ -106,6 +123,7 @@ class ElevenLabsTTSService(AsyncWordTTSService):
 
         self._api_key = api_key
         self._voice_id = voice_id
+        self._voice_settings = voice_settings
         self._model = model
         self._url = url
         self._params = params
@@ -172,6 +190,8 @@ class ElevenLabsTTSService(AsyncWordTTSService):
                 "text": " ",
                 "xi_api_key": self._api_key,
             }
+            if self._voice_settings:
+                msg["voice_settings"] = self._voice_settings
             await self._websocket.send(json.dumps(msg))
         except Exception as e:
             logger.error(f"{self} initialization error: {e}")
