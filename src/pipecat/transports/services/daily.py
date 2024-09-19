@@ -3,6 +3,7 @@
 #
 # SPDX-License-Identifier: BSD 2-Clause License
 #
+import threading
 
 import aiohttp
 import asyncio
@@ -331,52 +332,56 @@ class DailyTransportClient(EventHandler):
     async def _join(self):
         future = self._loop.create_future()
 
-        self._client.join(
-            self._room_url,
-            self._token,
-            completion=completion_callback(future),
-            client_settings={
-                "inputs": {
-                    "camera": {
-                        "isEnabled": self._params.camera_out_enabled,
-                        "settings": {
-                            "deviceId": self._camera_name(),
+        def __join():
+            self._client.join(
+                self._room_url,
+                self._token,
+                completion=completion_callback(future),
+                client_settings={
+                    "inputs": {
+                        "camera": {
+                            "isEnabled": self._params.camera_out_enabled,
+                            "settings": {
+                                "deviceId": self._camera_name(),
+                            },
                         },
-                    },
-                    "microphone": {
-                        "isEnabled": self._params.audio_out_enabled,
-                        "settings": {
-                            "deviceId": self._mic_name(),
-                            "customConstraints": {
-                                "autoGainControl": {"exact": False},
-                                "echoCancellation": {"exact": False},
-                                "noiseSuppression": {"exact": False},
+                        "microphone": {
+                            "isEnabled": self._params.audio_out_enabled,
+                            "settings": {
+                                "deviceId": self._mic_name(),
+                                "customConstraints": {
+                                    "autoGainControl": {"exact": False},
+                                    "echoCancellation": {"exact": False},
+                                    "noiseSuppression": {"exact": False},
+                                },
                             },
                         },
                     },
-                },
-                "publishing": {
-                    "camera": {
-                        "sendSettings": {
-                            "maxQuality": "low",
-                            "encodings": {
-                                "low": {
-                                    "maxBitrate": self._params.camera_out_bitrate,
-                                    "maxFramerate": self._params.camera_out_framerate,
-                                }
-                            },
+                    "publishing": {
+                        "camera": {
+                            "sendSettings": {
+                                "maxQuality": "low",
+                                "encodings": {
+                                    "low": {
+                                        "maxBitrate": self._params.camera_out_bitrate,
+                                        "maxFramerate": self._params.camera_out_framerate,
+                                    }
+                                },
+                            }
+                        },
+                        "microphone": {
+                            "sendSettings": {
+                                "channelConfig": "stereo" if self._params.audio_out_channels == 2 else "mono",
+                                "bitrate": self._params.audio_out_bitrate,
+                            }
                         }
                     },
-                    "microphone": {
-                        "sendSettings": {
-                            "channelConfig": "stereo" if self._params.audio_out_channels == 2 else "mono",
-                            "bitrate": self._params.audio_out_bitrate,
-                        }
-                    }
-                },
-            })
+                })
 
-        return await asyncio.wait_for(future, timeout=10)
+        thread = threading.Thread(target=__join, daemon=True)
+        thread.start()
+
+        return await asyncio.wait_for(future, timeout=15)
 
     async def leave(self):
         # Transport not joined, ignore.
