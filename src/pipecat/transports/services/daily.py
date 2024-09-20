@@ -376,7 +376,7 @@ class DailyTransportClient(EventHandler):
                 },
             })
 
-        return await asyncio.wait_for(future, timeout=600)
+        return await asyncio.wait_for(future, timeout=10)
 
     async def leave(self):
         # Transport not joined, ignore.
