@@ -62,6 +62,7 @@ try:
         FunctionResponse,
         GenerateContentConfig,
         Part,
+        SafetySetting,
     )
 except ModuleNotFoundError as e:
     logger.error(f"Exception: {e}")
@@ -134,7 +135,7 @@ class GoogleAssistantContextAggregator(OpenAIAssistantContextAggregator):
         )
 
     async def _update_function_call_result(
-        self, function_name: str, tool_call_id: str, result: Any
+            self, function_name: str, tool_call_id: str, result: Any
     ):
         for message in self._context.messages:
             if message.role == "user":
@@ -168,10 +169,10 @@ class GoogleContextAggregatorPair:
 
 class GoogleLLMContext(OpenAILLMContext):
     def __init__(
-        self,
-        messages: Optional[List[dict]] = None,
-        tools: Optional[List[dict]] = None,
-        tool_choice: Optional[dict] = None,
+            self,
+            messages: Optional[List[dict]] = None,
+            tools: Optional[List[dict]] = None,
+            tool_choice: Optional[dict] = None,
     ):
         super().__init__(messages=messages, tools=tools, tool_choice=tool_choice)
         self.system_message = None
@@ -219,7 +220,7 @@ class GoogleLLMContext(OpenAILLMContext):
         return msgs
 
     def add_image_frame_message(
-        self, *, format: str, size: tuple[int, int], image: bytes, text: str = None
+            self, *, format: str, size: tuple[int, int], image: bytes, text: str = None
     ):
         buffer = io.BytesIO()
         Image.frombytes(format, size, image).save(buffer, format="JPEG")
@@ -232,7 +233,7 @@ class GoogleLLMContext(OpenAILLMContext):
         self.add_message(Content(role="user", parts=parts))
 
     def add_audio_frames_message(
-        self, *, audio_frames: list[AudioRawFrame], text: str = "Audio follows"
+            self, *, audio_frames: list[AudioRawFrame], text: str = "Audio follows"
     ):
         if not audio_frames:
             return
@@ -460,18 +461,21 @@ class GoogleLLMService(LLMService):
         temperature: Optional[float] = Field(default=None, ge=0.0, le=2.0)
         top_k: Optional[int] = Field(default=None, ge=0)
         top_p: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+        presence_penalty: Optional[float] = Field(default=None, ge=-2.0, le=2.0)
+        frequency_penalty: Optional[float] = Field(default=None, ge=-2.0, le=2.0)
+        safety_settings: Optional[List[SafetySetting]] = Field(default_factory=list)
         extra: Optional[Dict[str, Any]] = Field(default_factory=dict)
 
     def __init__(
-        self,
-        *,
-        api_key: str,
-        model: str = "gemini-2.0-flash",
-        params: Optional[InputParams] = None,
-        system_instruction: Optional[str] = None,
-        tools: Optional[List[Dict[str, Any]]] = None,
-        tool_config: Optional[Dict[str, Any]] = None,
-        **kwargs,
+            self,
+            *,
+            api_key: str,
+            model: str = "gemini-2.0-flash",
+            params: Optional[InputParams] = None,
+            system_instruction: Optional[str] = None,
+            tools: Optional[List[Dict[str, Any]]] = None,
+            tool_config: Optional[Dict[str, Any]] = None,
+            **kwargs,
     ):
         super().__init__(**kwargs)
 
@@ -486,6 +490,9 @@ class GoogleLLMService(LLMService):
             "temperature": params.temperature,
             "top_k": params.top_k,
             "top_p": params.top_p,
+            "presence_penalty": params.presence_penalty,
+            "frequency_penalty": params.frequency_penalty,
+            "safety_settings": params.safety_settings if params.safety_settings else None,
             "extra": params.extra if isinstance(params.extra, dict) else {},
         }
         self._tools = tools
@@ -537,6 +544,9 @@ class GoogleLLMService(LLMService):
                     "top_p": self._settings["top_p"],
                     "top_k": self._settings["top_k"],
                     "max_output_tokens": self._settings["max_tokens"],
+                    "presence_penalty": self._settings["presence_penalty"],
+                    "frequency_penalty": self._settings["frequency_penalty"],
+                    "safety_settings": self._settings["safety_settings"],
                     "tools": tools,
                     "tool_config": tool_config,
                 }.items()
@@ -581,10 +591,7 @@ class GoogleLLMService(LLMService):
                                     arguments=function_call.args or {},
                                 )
 
-                    if (
-                        candidate.grounding_metadata
-                        and candidate.grounding_metadata.grounding_chunks
-                    ):
+                    if candidate.grounding_metadata and candidate.grounding_metadata.grounding_chunks:
                         m = candidate.grounding_metadata
                         rendered_content = (
                             m.search_entry_point.rendered_content if m.search_entry_point else None
@@ -608,7 +615,7 @@ class GoogleLLMService(LLMService):
                                         m.grounding_supports if m.grounding_supports else []
                                     )
                                     if grounding_support.grounding_chunk_indices
-                                    and index in grounding_support.grounding_chunk_indices
+                                       and index in grounding_support.grounding_chunk_indices
                                 ],
                             }
                             for index, grounding_chunk in enumerate(
@@ -664,11 +671,11 @@ class GoogleLLMService(LLMService):
             await self._process_context(context)
 
     def create_context_aggregator(
-        self,
-        context: OpenAILLMContext,
-        *,
-        user_params: LLMUserAggregatorParams = LLMUserAggregatorParams(),
-        assistant_params: LLMAssistantAggregatorParams = LLMAssistantAggregatorParams(),
+            self,
+            context: OpenAILLMContext,
+            *,
+            user_params: LLMUserAggregatorParams = LLMUserAggregatorParams(),
+            assistant_params: LLMAssistantAggregatorParams = LLMAssistantAggregatorParams(),
     ) -> GoogleContextAggregatorPair:
         """Create an instance of GoogleContextAggregatorPair from an
         OpenAILLMContext. Constructor keyword arguments for both the user and
