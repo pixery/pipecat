@@ -6,10 +6,10 @@
 
 import asyncio
 import time
-from typing import Any, AsyncIterable, Dict, Iterable, List, Optional, Tuple, Type
+from typing import Any, AsyncIterable, Dict, Iterable, List, Optional, Sequence, Tuple, Type
 
 from loguru import logger
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from pipecat.clocks.base_clock import BaseClock
 from pipecat.clocks.system_clock import SystemClock
@@ -22,6 +22,7 @@ from pipecat.frames.frames import (
     ErrorFrame,
     Frame,
     HeartbeatFrame,
+    InterruptionStrategy,
     LLMFullResponseEndFrame,
     MetricsFrame,
     StartFrame,
@@ -58,6 +59,7 @@ class PipelineParams(BaseModel):
         report_only_initial_ttfb: Whether to report only initial time to first byte.
         send_initial_empty_metrics: Whether to send initial empty metrics.
         start_metadata: Additional metadata for pipeline start.
+        interruption_strategies: Strategies for bot interruption behavior.
     """
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
@@ -69,10 +71,11 @@ class PipelineParams(BaseModel):
     enable_metrics: bool = False
     enable_usage_metrics: bool = False
     heartbeats_period_secs: float = HEARTBEAT_SECONDS
-    observers: List[BaseObserver] = []
+    observers: List[BaseObserver] = Field(default_factory=list)
     report_only_initial_ttfb: bool = False
     send_initial_empty_metrics: bool = True
-    start_metadata: Dict[str, Any] = {}
+    start_metadata: Dict[str, Any] = Field(default_factory=dict)
+    interruption_strategies: Optional[Sequence[InterruptionStrategy]] = None
 
 
 class PipelineTaskSource(FrameProcessor):
@@ -236,6 +239,7 @@ class PipelineTask(BaseTask):
             )
             observers.append(self._turn_trace_observer)
         self._finished = False
+        self._cancelled = False
 
         # This queue receives frames coming from the pipeline upstream.
         self._up_queue = asyncio.Queue()
@@ -346,7 +350,6 @@ class PipelineTask(BaseTask):
 
     async def cancel(self):
         """Stops the running pipeline immediately."""
-        logger.debug(f"Canceling pipeline task {self}")
         await self._cancel()
 
     async def run(self):
@@ -406,12 +409,15 @@ class PipelineTask(BaseTask):
                 await self.queue_frame(frame)
 
     async def _cancel(self):
-        # Make sure everything is cleaned up downstream. This is sent
-        # out-of-band from the main streaming task which is what we want since
-        # we want to cancel right away.
-        await self._source.push_frame(CancelFrame())
-        # Only cancel the push task. Everything else will be cancelled in run().
-        await self._task_manager.cancel_task(self._process_push_task)
+        if not self._cancelled:
+            logger.debug(f"Canceling pipeline task {self}")
+            self._cancelled = True
+            # Make sure everything is cleaned up downstream. This is sent
+            # out-of-band from the main streaming task which is what we want since
+            # we want to cancel right away.
+            await self._source.push_frame(CancelFrame())
+            # Only cancel the push task. Everything else will be cancelled in run().
+            await self._task_manager.cancel_task(self._process_push_task)
 
     async def _create_tasks(self):
         self._process_up_task = self._task_manager.create_task(
@@ -515,6 +521,7 @@ class PipelineTask(BaseTask):
             enable_metrics=self._params.enable_metrics,
             enable_usage_metrics=self._params.enable_usage_metrics,
             report_only_initial_ttfb=self._params.report_only_initial_ttfb,
+            interruption_strategies=self._params.interruption_strategies,
         )
         start_frame.metadata = self._params.start_metadata
         await self._source.queue_frame(start_frame, FrameDirection.DOWNSTREAM)

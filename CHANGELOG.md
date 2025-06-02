@@ -9,6 +9,113 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Added a new frame `FunctionCallsStartedFrame`. This frame is pushed both
+  upstream and downstream from the LLM service to indicate that one or more
+  function calls are going to be executed.
+
+- Added LLM services `on_function_calls_started` event. This event will be
+  triggered when the LLM service receives function calls from the model and is
+  going to start executing them.
+
+- Function calls can now be executed sequentially (in the order received in the
+  completion) by passing `run_in_parallel=False` when creating your LLM
+  service. By default, if the LLM completion returns 2 or more function calls
+  they run concurrently. In both cases, concurrently and sequentially, a new LLM
+  completion will run when the last function call finishes.
+
+- Added OpenTelemetry tracing for `GeminiMultimodalLiveLLMService` and
+  `OpenAIRealtimeBetaLLMService`.
+
+- Added `interruption_strategies` to `PipelineParams` using
+  `MinWordsInterruptionStrategy` to specify minimum words required to interrupt
+  the bot when it's speaking. Use
+  `interruption_strategies=[MinWordsInterruptionStrategy(min_words=N)]` to
+  require users to speak at least N words before interrupting. If not
+  specified, the normal interruption behavior applies.
+
+- `BaseInputTransport` now handles `StopFrame`. When a `StopFrame` is received
+  the transport will pause sending frames downstream until a new `StartFrame` is
+  received. This allows the transport to be reused (keeping the same connection)
+  in a different pipeline.
+
+- Updated AssemblyAI STT service to support their latest streaming
+  speech-to-text model with improved transcription latency and endpointing.
+
+- You can now access STT service results through the new
+  `TranscriptionFrame.result` and `InterimTranscriptionFrame.result` field. This
+  is useful in case you use some specific settings for the STT and you want to
+  access the STT results.
+
+- The examples runner is now public from the `pipecat.examples` package. This
+  allows everyone to build their own examples and run them easily.
+
+- It is now possible to push `OutputDTMFFrame` or `OutputDTMFUrgentFrame` with
+  `DailyTransport`. This will be sent properly if a Daily dial-out connection
+  has been established.
+
+- Added `OutputDTMFUrgentFrame` to send a DTMF keypress quickly. The previous
+  `OutputDTMFFrame` queues the keypress with the rest of data frames.
+
+- Added `DTMFAggregator`, which aggregates keypad presses into
+  `TranscriptionFrame`s. Aggregation occurs after a timeout, termination key
+  press, or user interruption. You can specify the prefix of the
+  `TranscriptionFrame`.
+
+- Added new functions `DailyTransport.start_transcription()` and
+  `DailyTransport.stop_transcription()` to be able to start and stop Daily
+  transcription dynamically (maybe with different settings).
+
+### Changed
+
+- Function calls are now cancelled by default if there's an interruption. To
+  disable this behavior you can set `cancel_on_interruption=False` when
+  registering the function call. Since function calls are executed as tasks you
+  can tell if a function call has been cancelled by catching the
+  `asyncio.CancelledError` exception (and don't forget to raise it again!).
+
+- Updated OpenTelemetry tracing attribute `metrics.ttfb_ms` to `metrics.ttfb`.
+  The attribute reports TTFB in seconds.
+
+### Deprecated
+
+- `DailyTransport.send_dtmf()` is deprecated, push an `OutputDTMFFrame` or an
+  `OutputDTMFUrgentFrame` instead.
+
+### Fixed
+
+- Fixed an issue with the `OpenAILLMContext` where non-Roman characters were
+  being incorrectly encoded as Unicode escape sequences. This was a logging
+  issue and did not impact the actual conversation.
+
+- In `AWSBedrockLLMService`, worked around a possible bug in AWS Bedrock where
+  a `toolConfig` is required if there has been previous tool use in the
+  messages array. This workaround includes a no_op factory function call is
+  used to satisfy the requirement.
+
+- Fixed `WebsocketClientTransport` to use `FrameProcessorSetup.task_manager`
+  instead of `StartFrame.task_manager`.
+
+### Performance
+
+- Use `uvloop` as the new event loop on Linux and macOS systems.
+
+## [0.0.68] - 2025-05-28
+
+### Added
+
+- Added `GoogleHttpTTSService` which uses Google's HTTP TTS API.
+
+- Added `TavusTransport`, a new transport implementation compatible with any
+  Pipecat pipeline. When using the `TavusTransport`the Pipecat bot will
+  connect in the same room as the Tavus Avatar and the user.
+
+- Added `PlivoFrameSerializer` to support Plivo calls. A full running example
+  has also been added to `examples/plivo-chatbot`.
+
+- Added `UserBotLatencyLogObserver`. This is an observer that logs the latency
+  between when the user stops speaking and when the bot starts speaking. This
+  gives you an initial idea on how quickly the AI services respond.
+
 - Added `SarvamTTSService`, which implements Sarvam AI's TTS API:
   https://docs.sarvam.ai/api-reference-docs/text-to-speech/convert.
 
@@ -26,8 +133,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   correspond to the `StartFrame`, `StopFrame`, `EndFrame` and `CancelFrame`
   respectively.
 
-- Added additional languages to `LmntTTSService`. Languages include: `hi`, `id`,
-  `it`, `ja`, `nl`, `pl`, `ru`, `sv`, `th`, `tr`, `uk`, `vi`.
+- Added additional languages to `LmntTTSService`. Languages include: `hi`,
+  `id`, `it`, `ja`, `nl`, `pl`, `ru`, `sv`, `th`, `tr`, `uk`, `vi`.
 
 - Added a `model` parameter to the `LmntTTSService` constructor, allowing
   switching between LMNT models.
@@ -65,8 +172,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ```
 
   By default, Pipecat has implemented service decorators to trace execution of
-  STT, LLM, and TTS services. You can enable tracing by setting `enable_tracing`
-  to `True` in the PipelineTask.
+  STT, LLM, and TTS services. You can enable tracing by setting
+  `enable_tracing` to `True` in the PipelineTask.
 
 - Added `TurnTrackingObserver`, which tracks the start and end of a user/bot
   turn pair and emits events `on_turn_started` and `on_turn_stopped`
@@ -75,6 +182,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Allow passing observers to `run_test()` while running unit tests.
 
 ### Changed
+
+- Upgraded `daily-python` to 0.19.1.
+
+- ⚠️ Updated `SmallWebRTCTransport` to align with how other transports handle
+  `on_client_disconnected`. Now, when the connection is closed and no reconnection
+  is attempted, `on_client_disconnected` is called instead of `on_client_close`. The
+  `on_client_close` callback is no longer used, use `on_client_disconnected` instead.
+
+- Check if `PipelineTask` has already been cancelled.
+
+- Don't raise an exception if event handler is not registered.
+
+- Upgraded `deepgram-sdk` to 4.1.0.
+
+- Updated `GoogleTTSService` to use Google's streaming TTS API. The default
+  voice also updated to `en-US-Chirp3-HD-Charon`.
+
+- ⚠️ Refactored the `TavusVideoService`, so it acts like a proxy, sending audio
+  to Tavus and receiving both audio and video. This will make
+  `TavusVideoService` usable with any Pipecat pipeline and with any transport.
+  This is a **breaking change**, check the
+  `examples/foundational/21a-tavus-layer-small-webrtc.py` to see how to use it.
+
+- `DailyTransport` now uses custom microphone audio tracks instead of virtual
+  microphones. Now, multiple Daily transports can be used in the same process.
+
+- `DailyTransport` now captures audio from individual participants instead of
+  the whole room. This allows identifying audio frames per participant.
 
 - Updated the default model for `AnthropicLLMService` to
   `claude-sonnet-4-20250514`.
@@ -117,6 +252,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Fixed a `DailyTransport` issue that was not allow capturing video frames if
+  framerate was greater than zero.
+
+- Fixed a `DeegramSTTService` connection issue when the user provided their own
+  `LiveOptions`.
+
+- Fixed a `DailyTransport` issue that would cause images needing resize to block
+  the event loop.
+
 - Fixed an issue with `ElevenLabsTTSService` where changing the model or voice
   while the service is running wasn't working.
 
@@ -130,10 +274,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
+- `DailyTransport`: process audio, video and events in separate tasks.
+
 - Don't create event handler tasks if no user event handlers have been
   registered.
 
 ### Other
+
+- It is now possible to run all (or most) foundational example with multiple
+  transports. By default, they run with P2P (Peer-To-Peer) WebRTC so you can try
+  everything locally. You can also run them with Daily or even with a Twilio
+  phone number.
 
 - Added foundation examples `07y-interruptible-minimax.py` and
   `07z-interruptible-sarvam.py`to show how to use the `MiniMaxHttpTTSService`

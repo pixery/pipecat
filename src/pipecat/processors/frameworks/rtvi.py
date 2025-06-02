@@ -110,7 +110,7 @@ class RTVIActionArgument(BaseModel):
 class RTVIAction(BaseModel):
     service: str
     action: str
-    arguments: List[RTVIActionArgument] = []
+    arguments: List[RTVIActionArgument] = Field(default_factory=list)
     result: Literal["bool", "number", "string", "array", "object"]
     handler: Callable[["RTVIProcessor", str, Dict[str, Any]], Awaitable[ActionResult]] = Field(
         exclude=True
@@ -843,7 +843,7 @@ class RTVIProcessor(FrameProcessor):
     async def _handle_client_ready(self, request_id: str):
         logger.debug("Received client-ready")
         if self._input_transport:
-            self._input_transport.start_audio_in_streaming()
+            await self._input_transport.start_audio_in_streaming()
 
         self._client_ready_id = request_id
         await self.set_client_ready()

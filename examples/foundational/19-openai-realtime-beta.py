@@ -14,7 +14,6 @@ from loguru import logger
 from pipecat.adapters.schemas.function_schema import FunctionSchema
 from pipecat.adapters.schemas.tools_schema import ToolsSchema
 from pipecat.audio.vad.silero import SileroVADAnalyzer
-from pipecat.audio.vad.vad_analyzer import VADParams
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
@@ -27,9 +26,9 @@ from pipecat.services.openai_realtime_beta import (
     SemanticTurnDetection,
     SessionProperties,
 )
-from pipecat.transports.base_transport import TransportParams
-from pipecat.transports.network.small_webrtc import SmallWebRTCTransport
-from pipecat.transports.network.webrtc_connection import SmallWebRTCConnection
+from pipecat.transports.base_transport import BaseTransport, TransportParams
+from pipecat.transports.network.fastapi_websocket import FastAPIWebsocketParams
+from pipecat.transports.services.daily import DailyParams
 
 load_dotenv(override=True)
 
@@ -44,6 +43,10 @@ async def fetch_weather_from_api(params: FunctionCallParams):
             "timestamp": datetime.now().strftime("%Y%m%d_%H%M%S"),
         }
     )
+
+
+async def fetch_restaurant_recommendation(params: FunctionCallParams):
+    await params.result_callback({"name": "The Golden Dragon"})
 
 
 weather_function = FunctionSchema(
@@ -63,21 +66,46 @@ weather_function = FunctionSchema(
     required=["location", "format"],
 )
 
+restaurant_function = FunctionSchema(
+    name="get_restaurant_recommendation",
+    description="Get a restaurant recommendation",
+    properties={
+        "location": {
+            "type": "string",
+            "description": "The city and state, e.g. San Francisco, CA",
+        },
+    },
+    required=["location"],
+)
+
 # Create tools schema
-tools = ToolsSchema(standard_tools=[weather_function])
+tools = ToolsSchema(standard_tools=[weather_function, restaurant_function])
 
 
-async def run_bot(webrtc_connection: SmallWebRTCConnection, _: argparse.Namespace):
+# We store functions so objects (e.g. SileroVADAnalyzer) don't get
+# instantiated. The function will be called when the desired transport gets
+# selected.
+transport_params = {
+    "daily": lambda: DailyParams(
+        audio_in_enabled=True,
+        audio_out_enabled=True,
+        vad_analyzer=SileroVADAnalyzer(),
+    ),
+    "twilio": lambda: FastAPIWebsocketParams(
+        audio_in_enabled=True,
+        audio_out_enabled=True,
+        vad_analyzer=SileroVADAnalyzer(),
+    ),
+    "webrtc": lambda: TransportParams(
+        audio_in_enabled=True,
+        audio_out_enabled=True,
+        vad_analyzer=SileroVADAnalyzer(),
+    ),
+}
+
+
+async def run_example(transport: BaseTransport, _: argparse.Namespace, handle_sigint: bool):
     logger.info(f"Starting bot")
-
-    transport = SmallWebRTCTransport(
-        webrtc_connection=webrtc_connection,
-        params=TransportParams(
-            audio_in_enabled=True,
-            audio_out_enabled=True,
-            vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.8)),
-        ),
-    )
 
     session_properties = SessionProperties(
         input_audio_transcription=InputAudioTranscription(),
@@ -88,7 +116,7 @@ async def run_bot(webrtc_connection: SmallWebRTCConnection, _: argparse.Namespac
         # turn_detection=False,
         input_audio_noise_reduction=InputAudioNoiseReduction(type="near_field"),
         # tools=tools,
-        instructions="""Your knowledge cutoff is 2023-10. You are a helpful and friendly AI.
+        instructions="""You are a helpful and friendly AI.
 
 Act like a human, but remember that you aren't a human and that you can't do human
 things in the real world. Your voice and personality should be warm and engaging, with a lively and
@@ -100,6 +128,10 @@ even if you're asked about them.
 -
 You are participating in a voice conversation. Keep your responses concise, short, and to the point
 unless specifically asked to elaborate on a topic.
+
+You have access to the following tools:
+- get_current_weather: Get the current weather for a given location.
+- get_restaurant_recommendation: Get a restaurant recommendation for a given location.
 
 Remember, your responses should be short. Just one or two sentences, usually.""",
     )
@@ -113,6 +145,7 @@ Remember, your responses should be short. Just one or two sentences, usually."""
     # you can either register a single function for all function calls, or specific functions
     # llm.register_function(None, fetch_weather_from_api)
     llm.register_function("get_current_weather", fetch_weather_from_api)
+    llm.register_function("get_restaurant_recommendation", fetch_restaurant_recommendation)
 
     # Create a standard OpenAI LLM context object using the normal messages format. The
     # OpenAIRealtimeBetaLLMService will convert this internally to messages that the
@@ -163,18 +196,14 @@ Remember, your responses should be short. Just one or two sentences, usually."""
     @transport.event_handler("on_client_disconnected")
     async def on_client_disconnected(transport, client):
         logger.info(f"Client disconnected")
-
-    @transport.event_handler("on_client_closed")
-    async def on_client_closed(transport, client):
-        logger.info(f"Client closed connection")
         await task.cancel()
 
-    runner = PipelineRunner(handle_sigint=False)
+    runner = PipelineRunner(handle_sigint=handle_sigint)
 
     await runner.run(task)
 
 
 if __name__ == "__main__":
-    from run import main
+    from pipecat.examples.run import main
 
-    main()
+    main(run_example, transport_params=transport_params)
