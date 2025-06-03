@@ -196,10 +196,10 @@ class BaseInputTransport(FrameProcessor):
             await self._handle_bot_interruption(frame)
         elif isinstance(frame, BotStartedSpeakingFrame):
             await self._handle_bot_started_speaking(frame)
-            await self.push_frame(frame)
+            await self.push_frame(frame, direction)
         elif isinstance(frame, BotStoppedSpeakingFrame):
             await self._handle_bot_stopped_speaking(frame)
-            await self.push_frame(frame)
+            await self.push_frame(frame, direction)
         elif isinstance(frame, EmulateUserStartedSpeakingFrame):
             logger.debug("Emulating user started speaking")
             await self._handle_user_interruption(UserStartedSpeakingFrame(emulated=True))
@@ -246,7 +246,7 @@ class BaseInputTransport(FrameProcessor):
             # 1. No interruption config is set, OR
             # 2. Interruption config is set but bot is not speaking
             should_push_immediate_interruption = (
-                self.interruption_strategies is None or not self._bot_speaking
+                not self.interruption_strategies or not self._bot_speaking
             )
 
             # Make sure we notify about interruptions quickly out-of-band.

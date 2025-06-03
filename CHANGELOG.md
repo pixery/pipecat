@@ -5,7 +5,7 @@ All notable changes to **Pipecat** will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.0.69] - 2025-06-02 "AI Engineer World's Fair release" ✨
 
 ### Added
 
@@ -26,12 +26,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added OpenTelemetry tracing for `GeminiMultimodalLiveLLMService` and
   `OpenAIRealtimeBetaLLMService`.
 
-- Added `interruption_strategies` to `PipelineParams` using
-  `MinWordsInterruptionStrategy` to specify minimum words required to interrupt
-  the bot when it's speaking. Use
-  `interruption_strategies=[MinWordsInterruptionStrategy(min_words=N)]` to
-  require users to speak at least N words before interrupting. If not
-  specified, the normal interruption behavior applies.
+- Added initial support for interruption strategies, which determine if the user
+  should interrupt the bot while the bot is speaking. Interruption strategies
+  can be based on factors such as audio volume or the number of words spoken by
+  the user. These can be specified via the new `interruption_strategies` field
+  in `PipelineParams`. A new `MinWordsInterruptionStrategy` strategy has been
+  introduced which triggers an interruption if the user has spoken a minimum
+  number of words. If no interruption strategies are specified, the normal
+  interruption behavior applies. If multiple strategies are provided, the first
+  one that evaluates to true will trigger the interruption.
 
 - `BaseInputTransport` now handles `StopFrame`. When a `StopFrame` is received
   the transport will pause sending frames downstream until a new `StartFrame` is
@@ -67,6 +70,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Reverted the default model for `GeminiMultimodalLiveLLMService` back to
+  `models/gemini-2.0-flash-live-001`.
+  `gemini-2.5-flash-preview-native-audio-dialog` has inconsistent performance.
+  You can opt in to using this model by setting the `model` arg.
+
 - Function calls are now cancelled by default if there's an interruption. To
   disable this behavior you can set `cancel_on_interruption=False` when
   registering the function call. Since function calls are executed as tasks you
@@ -82,6 +90,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `OutputDTMFUrgentFrame` instead.
 
 ### Fixed
+
+- Fixed an issue with `ElevenLabsTTSService` where long responses would
+  continue generating output even after an interruption.
 
 - Fixed an issue with the `OpenAILLMContext` where non-Roman characters were
   being incorrectly encoded as Unicode escape sequences. This was a logging
