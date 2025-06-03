@@ -208,7 +208,14 @@ class GoogleLLMContext(OpenAILLMContext):
     def get_messages_for_logging(self):
         msgs = []
         for message in self.messages:
-            obj = message.to_json_dict()
+            # Handle both Content objects and dict objects
+            if hasattr(message, 'to_json_dict'):
+                # It's a Content object
+                obj = message.to_json_dict()
+            else:
+                # It's already a dict object
+                obj = message
+            
             try:
                 if "parts" in obj:
                     for part in obj["parts"]:
