@@ -4,15 +4,14 @@
 # SPDX-License-Identifier: BSD 2-Clause License
 #
 
-import argparse
 import os
 
-import aiohttp
 from dotenv import load_dotenv
 from loguru import logger
 
 from pipecat.frames.frames import (
     LLMMessagesAppendFrame,
+    LLMRunFrame,
 )
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
@@ -27,10 +26,11 @@ from pipecat.processors.frameworks.rtvi import (
     RTVIProcessor,
     RTVIServerMessageFrame,
 )
+from pipecat.runner.types import RunnerArguments
+from pipecat.runner.utils import create_transport
 from pipecat.services.openai import OpenAIContextAggregatorPair
 from pipecat.services.openai.llm import OpenAILLMService
 from pipecat.transports.base_transport import BaseTransport, TransportParams
-from pipecat.transports.services.daily import DailyParams
 
 load_dotenv(override=True)
 
@@ -54,7 +54,7 @@ def create_action_llm_append_to_messages(context_aggregator: OpenAIContextAggreg
                 frame = LLMMessagesAppendFrame(messages=arguments["messages"])
                 await rtvi.push_frame(frame)
 
-            frame = context_aggregator.user().get_context_frame()
+            frame = LLMRunFrame()
             await rtvi.push_frame(frame)
         return True
 
@@ -79,84 +79,86 @@ transport_params = {
 }
 
 
-async def run_example(transport: BaseTransport, _: argparse.Namespace, handle_sigint: bool):
+async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     logger.info(f"Starting bot")
 
-    # Create an HTTP session for API calls
-    async with aiohttp.ClientSession() as session:
-        llm = OpenAILLMService(api_key=os.getenv("OPENAI_API_KEY"))
+    llm = OpenAILLMService(api_key=os.getenv("OPENAI_API_KEY"))
 
-        messages = [
-            {
-                "role": "system",
-                "content": "You are a helpful LLM in a WebRTC call. Your goal is to demonstrate your capabilities in a succinct way. Respond to what the user said in a creative and helpful way.",
-            },
+    messages = [
+        {
+            "role": "system",
+            "content": "You are a helpful LLM in a WebRTC call. Your goal is to demonstrate your capabilities in a succinct way. Respond to what the user said in a creative and helpful way.",
+        },
+    ]
+
+    context = OpenAILLMContext(messages)
+    context_aggregator = llm.create_context_aggregator(context)
+
+    action_llm_append_to_messages = create_action_llm_append_to_messages(context_aggregator)
+    rtvi = RTVIProcessor(config=RTVIConfig(config=[]))
+    rtvi.register_action(action_llm_append_to_messages)
+
+    pipeline = Pipeline(
+        [
+            transport.input(),
+            rtvi,
+            context_aggregator.user(),
+            llm,
+            transport.output(),
+            context_aggregator.assistant(),
         ]
+    )
 
-        context = OpenAILLMContext(messages)
-        context_aggregator = llm.create_context_aggregator(context)
+    task = PipelineTask(
+        pipeline,
+        params=PipelineParams(
+            enable_metrics=True,
+            enable_usage_metrics=True,
+        ),
+        idle_timeout_secs=runner_args.pipeline_idle_timeout_secs,
+        observers=[RTVIObserver(rtvi)],
+    )
 
-        action_llm_append_to_messages = create_action_llm_append_to_messages(context_aggregator)
-        rtvi = RTVIProcessor(config=RTVIConfig(config=[]))
-        rtvi.register_action(action_llm_append_to_messages)
+    @rtvi.event_handler("on_client_ready")
+    async def on_client_ready(rtvi):
+        logger.info("Pipecat client ready.")
+        await rtvi.set_bot_ready()
 
-        pipeline = Pipeline(
-            [
-                transport.input(),
-                rtvi,
-                context_aggregator.user(),
-                llm,
-                transport.output(),
-                context_aggregator.assistant(),
-            ]
-        )
+        # This block is frontend UI specific
+        # These messages are intended for small webrtc UI to only handle text
+        # https://github.com/pipecat-ai/small-webrtc-prebuilt
+        messages = {
+            "show_text_container": True,
+            "show_video_container": False,
+            "show_debug_container": False,
+        }
 
-        task = PipelineTask(
-            pipeline,
-            params=PipelineParams(
-                allow_interruptions=True,
-                enable_metrics=True,
-            ),
-            observers=[RTVIObserver(rtvi)],
-        )
+        rtvi_frame = RTVIServerMessageFrame(data=messages)
+        await task.queue_frames([rtvi_frame])
 
-        @rtvi.event_handler("on_client_ready")
-        async def on_client_ready(rtvi):
-            logger.info("Pipecat client ready.")
-            await rtvi.set_bot_ready()
+    @transport.event_handler("on_client_connected")
+    async def on_client_connected(transport, client):
+        logger.info(f"Client connected: {client}")
+        # Kick off the conversation.
+        await task.queue_frames([LLMRunFrame()])
 
-            # This block is frontend UI specific
-            # These messages are intended for small webrtc UI to only handle text
-            # https://github.com/pipecat-ai/small-webrtc-prebuilt
-            messages = {
-                "show_text_container": True,
-                "show_video_container": False,
-                "show_debug_container": False,
-            }
-            rtvi_frame = RTVIServerMessageFrame(data=messages)
-            await task.queue_frames([rtvi_frame])
+    @transport.event_handler("on_client_disconnected")
+    async def on_client_disconnected(transport, client):
+        logger.info(f"Client disconnected")
+        await task.cancel()
 
-        @transport.event_handler("on_client_connected")
-        async def on_client_connected(transport, client):
-            logger.info(f"Client connected: {client}")
-            # Kick off the conversation.
-            await task.queue_frames([context_aggregator.user().get_context_frame()])
+    runner = PipelineRunner(handle_sigint=runner_args.handle_sigint)
 
-        @transport.event_handler("on_client_disconnected")
-        async def on_client_disconnected(transport, client):
-            logger.info(f"Client disconnected")
+    await runner.run(task)
 
-        @transport.event_handler("on_client_closed")
-        async def on_client_closed(transport, client):
-            logger.info(f"Client closed connection")
-            await task.cancel()
 
-        runner = PipelineRunner(handle_sigint=False)
-
-        await runner.run(task)
+async def bot(runner_args: RunnerArguments):
+    """Main bot entry point compatible with Pipecat Cloud."""
+    transport = await create_transport(runner_args, transport_params)
+    await run_bot(transport, runner_args)
 
 
 if __name__ == "__main__":
-    from pipecat.examples.run import main
+    from pipecat.runner.run import main
 
-    main(run_example, transport_params=transport_params)
+    main()

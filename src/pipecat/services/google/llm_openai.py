@@ -4,6 +4,12 @@
 # SPDX-License-Identifier: BSD 2-Clause License
 #
 
+"""Google LLM service using OpenAI-compatible API format.
+
+This module provides integration with Google's AI LLM models using the OpenAI
+API format through Google's Gemini API OpenAI compatibility layer.
+"""
+
 import json
 import os
 
@@ -24,8 +30,21 @@ from pipecat.services.openai.llm import OpenAILLMService
 
 
 class GoogleLLMOpenAIBetaService(OpenAILLMService):
-    """This class implements inference with Google's AI LLM models using the OpenAI format.
-    Ref - https://ai.google.dev/gemini-api/docs/openai
+    """Google LLM service using OpenAI-compatible API format.
+
+    This service provides access to Google's AI LLM models (like Gemini) through
+    the OpenAI API format. It handles streaming responses, function calls, and
+    tool usage while maintaining compatibility with OpenAI's interface.
+
+    Note: This service includes a workaround for a Google API bug where function
+    call indices may be incorrectly set to None, resulting in empty function names.
+
+    .. deprecated:: 0.0.82
+        GoogleLLMOpenAIBetaService is deprecated and will be removed in a future version.
+        Use GoogleLLMService instead for better integration with Google's native API.
+
+    Reference:
+        https://ai.google.dev/gemini-api/docs/openai
     """
 
     def __init__(
@@ -36,6 +55,25 @@ class GoogleLLMOpenAIBetaService(OpenAILLMService):
         model: str = "gemini-2.0-flash",
         **kwargs,
     ):
+        """Initialize the Google LLM service.
+
+        Args:
+            api_key: Google API key for authentication.
+            base_url: Base URL for Google's OpenAI-compatible API.
+            model: Google model name to use (e.g., "gemini-2.0-flash").
+            **kwargs: Additional arguments passed to the parent OpenAILLMService.
+        """
+        import warnings
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("always")
+            warnings.warn(
+                "GoogleLLMOpenAIBetaService is deprecated and will be removed in a future version. "
+                "Use GoogleLLMService instead for better integration with Google's native API.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+
         super().__init__(api_key=api_key, base_url=base_url, model=model, **kwargs)
 
     async def _process_context(self, context: OpenAILLMContext):
@@ -49,9 +87,9 @@ class GoogleLLMOpenAIBetaService(OpenAILLMService):
 
         await self.start_ttfb_metrics()
 
-        chunk_stream: AsyncStream[ChatCompletionChunk] = await self._stream_chat_completions(
-            context
-        )
+        chunk_stream: AsyncStream[
+            ChatCompletionChunk
+        ] = await self._stream_chat_completions_specific_context(context)
 
         async for chunk in chunk_stream:
             if chunk.usage:

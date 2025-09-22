@@ -4,16 +4,22 @@
 # SPDX-License-Identifier: BSD 2-Clause License
 #
 
+"""DTMF aggregation processor for converting keypad input to transcription.
+
+This module provides a frame processor that aggregates DTMF (Dual-Tone Multi-Frequency)
+keypad inputs into meaningful sequences and converts them to transcription frames
+for downstream processing by LLM context aggregators.
+"""
+
 import asyncio
 from typing import Optional
 
+from pipecat.audio.dtmf.types import KeypadEntry
 from pipecat.frames.frames import (
-    BotInterruptionFrame,
     CancelFrame,
     EndFrame,
     Frame,
     InputDTMFFrame,
-    KeypadEntry,
     StartFrame,
     TranscriptionFrame,
 )
@@ -26,16 +32,12 @@ class DTMFAggregator(FrameProcessor):
 
     The aggregator accumulates digits from InputDTMFFrame instances and flushes
     when:
+
     - Timeout occurs (configurable idle period)
     - Termination digit is received (default: '#')
     - EndFrame or CancelFrame is received
 
     Emits TranscriptionFrame for compatibility with existing LLM context aggregators.
-
-    Args:
-        timeout: Idle timeout in seconds before flushing
-        termination_digit: Digit that triggers immediate flush
-        prefix: Prefix added to DTMF sequence in transcription
     """
 
     def __init__(
@@ -45,6 +47,14 @@ class DTMFAggregator(FrameProcessor):
         prefix: str = "DTMF: ",
         **kwargs,
     ):
+        """Initialize the DTMF aggregator.
+
+        Args:
+            timeout: Idle timeout in seconds before flushing
+            termination_digit: Digit that triggers immediate flush
+            prefix: Prefix added to DTMF sequence in transcription
+            **kwargs: Additional arguments passed to FrameProcessor
+        """
         super().__init__(**kwargs)
         self._aggregation = ""
         self._idle_timeout = timeout
@@ -54,7 +64,18 @@ class DTMFAggregator(FrameProcessor):
         self._digit_event = asyncio.Event()
         self._aggregation_task: Optional[asyncio.Task] = None
 
+    async def cleanup(self) -> None:
+        """Clean up resources."""
+        await super().cleanup()
+        await self._stop_aggregation_task()
+
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
+        """Process incoming frames and handle DTMF aggregation.
+
+        Args:
+            frame: The frame to process.
+            direction: The direction of frame flow in the pipeline.
+        """
         await super().process_frame(frame, direction)
 
         if isinstance(frame, StartFrame):
@@ -81,9 +102,9 @@ class DTMFAggregator(FrameProcessor):
         digit_value = frame.button.value
         self._aggregation += digit_value
 
-        # For first digit, schedule interruption in separate task
+        # For first digit, schedule interruption.
         if is_first_digit:
-            asyncio.create_task(self._send_interruption_task())
+            await self.push_interruption_task_frame_and_wait()
 
         # Check for immediate flush conditions
         if frame.button == self._termination_digit:
@@ -91,15 +112,6 @@ class DTMFAggregator(FrameProcessor):
         else:
             # Signal digit received for timeout handling
             self._digit_event.set()
-
-    async def _send_interruption_task(self):
-        """Send interruption frame safely in a separate task."""
-        try:
-            # Send the interruption frame
-            await self.push_frame(BotInterruptionFrame(), FrameDirection.UPSTREAM)
-        except Exception as e:
-            # Log error but don't propagate
-            print(f"Error sending interruption: {e}")
 
     def _create_aggregation_task(self) -> None:
         """Creates the aggregation task if it hasn't been created yet."""
@@ -136,8 +148,3 @@ class DTMFAggregator(FrameProcessor):
         await self.push_frame(transcription_frame)
 
         self._aggregation = ""
-
-    async def cleanup(self) -> None:
-        """Clean up resources."""
-        await super().cleanup()
-        await self._stop_aggregation_task()

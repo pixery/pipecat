@@ -4,6 +4,12 @@
 # SPDX-License-Identifier: BSD 2-Clause License
 #
 
+"""ElevenLabs text-to-speech service implementations.
+
+This module provides WebSocket and HTTP-based TTS services using ElevenLabs API
+with support for streaming audio, word timestamps, and voice customization.
+"""
+
 import asyncio
 import base64
 import json
@@ -19,9 +25,9 @@ from pipecat.frames.frames import (
     EndFrame,
     ErrorFrame,
     Frame,
+    InterruptionFrame,
     LLMFullResponseEndFrame,
     StartFrame,
-    StartInterruptionFrame,
     TTSAudioRawFrame,
     TTSStartedFrame,
     TTSStoppedFrame,
@@ -37,6 +43,8 @@ from pipecat.utils.tracing.service_decorators import traced_tts
 # See .env.example for ElevenLabs configuration needed
 try:
     import websockets
+    from websockets.asyncio.client import connect as websocket_connect
+    from websockets.protocol import State
 except ModuleNotFoundError as e:
     logger.error(f"Exception: {e}")
     logger.error("In order to use ElevenLabs, you need to `pip install pipecat-ai[elevenlabs]`.")
@@ -56,6 +64,14 @@ ELEVENLABS_MULTILINGUAL_MODELS = {
 
 
 def language_to_elevenlabs_language(language: Language) -> Optional[str]:
+    """Convert a Language enum to ElevenLabs language code.
+
+    Args:
+        language: The Language enum value to convert.
+
+    Returns:
+        The corresponding ElevenLabs language code, or None if not supported.
+    """
     BASE_LANGUAGES = {
         Language.AR: "ar",
         Language.BG: "bg",
@@ -105,6 +121,14 @@ def language_to_elevenlabs_language(language: Language) -> Optional[str]:
 
 
 def output_format_from_sample_rate(sample_rate: int) -> str:
+    """Get the appropriate output format string for a given sample rate.
+
+    Args:
+        sample_rate: The audio sample rate in Hz.
+
+    Returns:
+        The ElevenLabs output format string.
+    """
     match sample_rate:
         case 8000:
             return "pcm_8000"
@@ -128,10 +152,10 @@ def build_elevenlabs_voice_settings(
     """Build voice settings dictionary for ElevenLabs based on provided settings.
 
     Args:
-        settings: Dictionary containing voice settings parameters
+        settings: Dictionary containing voice settings parameters.
 
     Returns:
-        Dictionary of voice settings or None if no valid settings are provided
+        Dictionary of voice settings or None if no valid settings are provided.
     """
     voice_setting_keys = ["stability", "similarity_boost", "style", "use_speaker_boost", "speed"]
 
@@ -146,26 +170,83 @@ def build_elevenlabs_voice_settings(
 def calculate_word_times(
     alignment_info: Mapping[str, Any], cumulative_time: float
 ) -> List[Tuple[str, float]]:
-    zipped_times = list(zip(alignment_info["chars"], alignment_info["charStartTimesMs"]))
+    """Calculate word timestamps from character alignment information.
 
-    words = "".join(alignment_info["chars"]).split(" ")
+    Args:
+        alignment_info: Character alignment data from ElevenLabs API.
+        cumulative_time: Base time offset for this chunk.
 
-    # Calculate start time for each word. We do this by finding a space character
-    # and using the previous word time, also taking into account there might not
-    # be a space at the end.
-    times = []
-    for i, (a, b) in enumerate(zipped_times):
-        if a == " " or i == len(zipped_times) - 1:
-            t = cumulative_time + (zipped_times[i - 1][1] / 1000.0)
-            times.append(t)
+    Returns:
+        List of (word, timestamp) tuples.
+    """
+    chars = alignment_info["chars"]
+    char_start_times_ms = alignment_info["charStartTimesMs"]
 
-    word_times = list(zip(words, times))
+    if len(chars) != len(char_start_times_ms):
+        logger.error(
+            f"calculate_word_times: length mismatch - chars={len(chars)}, times={len(char_start_times_ms)}"
+        )
+        return []
+
+    # Build words and track their start positions
+    words = []
+    word_start_indices = []
+    current_word = ""
+    word_start_index = None
+
+    for i, char in enumerate(chars):
+        if char == " ":
+            # End of current word
+            if current_word:  # Only add non-empty words
+                words.append(current_word)
+                word_start_indices.append(word_start_index)
+                current_word = ""
+                word_start_index = None
+        else:
+            # Building a word
+            if word_start_index is None:  # First character of new word
+                word_start_index = i
+            current_word += char
+
+    # Handle the last word if there's no trailing space
+    if current_word and word_start_index is not None:
+        words.append(current_word)
+        word_start_indices.append(word_start_index)
+
+    # Calculate timestamps for each word
+    word_times = []
+    for word, start_idx in zip(words, word_start_indices):
+        # Convert from milliseconds to seconds and add cumulative offset
+        start_time_seconds = cumulative_time + (char_start_times_ms[start_idx] / 1000.0)
+        word_times.append((word, start_time_seconds))
 
     return word_times
 
 
 class ElevenLabsTTSService(AudioContextWordTTSService):
+    """ElevenLabs WebSocket-based TTS service with word timestamps.
+
+    Provides real-time text-to-speech using ElevenLabs' WebSocket streaming API.
+    Supports word-level timestamps, audio context management, and various voice
+    customization options including stability, similarity boost, and speed controls.
+    """
+
     class InputParams(BaseModel):
+        """Input parameters for ElevenLabs TTS configuration.
+
+        Parameters:
+            language: Language to use for synthesis.
+            stability: Voice stability control (0.0 to 1.0).
+            similarity_boost: Similarity boost control (0.0 to 1.0).
+            style: Style control for voice expression (0.0 to 1.0).
+            use_speaker_boost: Whether to use speaker boost enhancement.
+            speed: Voice speed control (0.7 to 1.2).
+            auto_mode: Whether to enable automatic mode optimization.
+            enable_ssml_parsing: Whether to parse SSML tags in text.
+            enable_logging: Whether to enable ElevenLabs logging.
+            apply_text_normalization: Text normalization mode ("auto", "on", "off").
+        """
+
         language: Optional[Language] = None
         stability: Optional[float] = None
         similarity_boost: Optional[float] = None
@@ -175,18 +256,32 @@ class ElevenLabsTTSService(AudioContextWordTTSService):
         auto_mode: Optional[bool] = True
         enable_ssml_parsing: Optional[bool] = None
         enable_logging: Optional[bool] = None
+        apply_text_normalization: Optional[Literal["auto", "on", "off"]] = None
 
     def __init__(
         self,
         *,
         api_key: str,
         voice_id: str,
-        model: str = "eleven_flash_v2_5",
+        model: str = "eleven_turbo_v2_5",
         url: str = "wss://api.elevenlabs.io",
         sample_rate: Optional[int] = None,
         params: Optional[InputParams] = None,
+        aggregate_sentences: Optional[bool] = True,
         **kwargs,
     ):
+        """Initialize the ElevenLabs TTS service.
+
+        Args:
+            api_key: ElevenLabs API key for authentication.
+            voice_id: ID of the voice to use for synthesis.
+            model: TTS model to use (e.g., "eleven_turbo_v2_5").
+            url: WebSocket URL for ElevenLabs TTS API.
+            sample_rate: Audio sample rate. If None, uses default.
+            params: Additional input parameters for voice customization.
+            aggregate_sentences: Whether to aggregate sentences within the TTSService.
+            **kwargs: Additional arguments passed to the parent service.
+        """
         # Aggregating sentences still gives cleaner-sounding results and fewer
         # artifacts than streaming one word at a time. On average, waiting for a
         # full sentence should only "cost" us 15ms or so with GPT-4o or a Llama
@@ -202,7 +297,7 @@ class ElevenLabsTTSService(AudioContextWordTTSService):
         # speaking for a while, so we want the parent class to send TTSStopFrame
         # after a short period not receiving any audio.
         super().__init__(
-            aggregate_sentences=True,
+            aggregate_sentences=aggregate_sentences,
             push_text_frames=False,
             push_stop_frames=True,
             pause_frame_processing=True,
@@ -226,6 +321,7 @@ class ElevenLabsTTSService(AudioContextWordTTSService):
             "auto_mode": str(params.auto_mode).lower(),
             "enable_ssml_parsing": params.enable_ssml_parsing,
             "enable_logging": params.enable_logging,
+            "apply_text_normalization": params.apply_text_normalization,
         }
         self.set_model_name(model)
         self.set_voice(voice_id)
@@ -243,49 +339,128 @@ class ElevenLabsTTSService(AudioContextWordTTSService):
         self._keepalive_task = None
 
     def can_generate_metrics(self) -> bool:
+        """Check if this service can generate processing metrics.
+
+        Returns:
+            True, as ElevenLabs service supports metrics generation.
+        """
         return True
 
     def language_to_service_language(self, language: Language) -> Optional[str]:
+        """Convert a Language enum to ElevenLabs language format.
+
+        Args:
+            language: The language to convert.
+
+        Returns:
+            The ElevenLabs-specific language code, or None if not supported.
+        """
         return language_to_elevenlabs_language(language)
 
     def _set_voice_settings(self):
         return build_elevenlabs_voice_settings(self._settings)
 
     async def set_model(self, model: str):
+        """Set the TTS model and reconnect.
+
+        Args:
+            model: The model name to use for synthesis.
+        """
         await super().set_model(model)
         logger.info(f"Switching TTS model to: [{model}]")
         await self._disconnect()
         await self._connect()
 
     async def _update_settings(self, settings: Mapping[str, Any]):
+        """Update service settings and reconnect if voice, model, or language changed."""
+        # Track previous values for settings that require reconnection
         prev_voice = self._voice_id
+        prev_model = self.model_name
+        prev_language = self._settings.get("language")
+        # Create snapshot of current voice settings to detect changes after update
+        prev_voice_settings = self._voice_settings.copy() if self._voice_settings else None
+
         await super()._update_settings(settings)
-        if not prev_voice == self._voice_id:
-            logger.info(f"Switching TTS voice to: [{self._voice_id}]")
+
+        # Update voice settings for the next context creation
+        self._voice_settings = self._set_voice_settings()
+
+        # Check if URL-level settings changed (these require reconnection)
+        url_changed = (
+            prev_voice != self._voice_id
+            or prev_model != self.model_name
+            or prev_language != self._settings.get("language")
+        )
+
+        # Check if only voice settings changed (speed, stability, etc.)
+        voice_settings_changed = prev_voice_settings != self._voice_settings
+
+        if url_changed:
+            # These settings are in the WebSocket URL, so we need to reconnect
+            logger.debug(
+                f"URL-level setting changed (voice/model/language), reconnecting WebSocket"
+            )
             await self._disconnect()
             await self._connect()
+        elif voice_settings_changed and self._context_id:
+            # Voice settings can be updated by closing current context
+            # so new one gets created with updated voice settings
+            logger.debug(f"Voice settings changed, closing current context to apply changes")
+            try:
+                if self._websocket:
+                    await self._websocket.send(
+                        json.dumps({"context_id": self._context_id, "close_context": True})
+                    )
+            except Exception as e:
+                logger.warning(f"Error closing context for voice settings update: {e}")
+            self._context_id = None
+            self._started = False
 
     async def start(self, frame: StartFrame):
+        """Start the ElevenLabs TTS service.
+
+        Args:
+            frame: The start frame containing initialization parameters.
+        """
         await super().start(frame)
         self._output_format = output_format_from_sample_rate(self.sample_rate)
         await self._connect()
 
     async def stop(self, frame: EndFrame):
+        """Stop the ElevenLabs TTS service.
+
+        Args:
+            frame: The end frame.
+        """
         await super().stop(frame)
         await self._disconnect()
 
     async def cancel(self, frame: CancelFrame):
+        """Cancel the ElevenLabs TTS service.
+
+        Args:
+            frame: The cancel frame.
+        """
         await super().cancel(frame)
         await self._disconnect()
 
     async def flush_audio(self):
-        if self._websocket and self._context_id:
-            msg = {"context_id": self._context_id, "flush": True}
-            await self._websocket.send(json.dumps(msg))
+        """Flush any pending audio and finalize the current context."""
+        if not self._context_id or not self._websocket:
+            return
+        logger.trace(f"{self}: flushing audio")
+        msg = {"context_id": self._context_id, "flush": True}
+        await self._websocket.send(json.dumps(msg))
 
     async def push_frame(self, frame: Frame, direction: FrameDirection = FrameDirection.DOWNSTREAM):
+        """Push a frame and handle state changes.
+
+        Args:
+            frame: The frame to push.
+            direction: The direction to push the frame.
+        """
         await super().push_frame(frame, direction)
-        if isinstance(frame, (TTSStoppedFrame, StartInterruptionFrame)):
+        if isinstance(frame, (TTSStoppedFrame, InterruptionFrame)):
             self._started = False
             if isinstance(frame, TTSStoppedFrame):
                 await self.add_word_timestamps([("Reset", 0)])
@@ -312,7 +487,7 @@ class ElevenLabsTTSService(AudioContextWordTTSService):
 
     async def _connect_websocket(self):
         try:
-            if self._websocket and self._websocket.open:
+            if self._websocket and self._websocket.state is State.OPEN:
                 return
 
             logger.debug("Connecting to ElevenLabs")
@@ -328,6 +503,9 @@ class ElevenLabsTTSService(AudioContextWordTTSService):
             if self._settings["enable_logging"]:
                 url += f"&enable_logging={self._settings['enable_logging']}"
 
+            if self._settings["apply_text_normalization"] is not None:
+                url += f"&apply_text_normalization={self._settings['apply_text_normalization']}"
+
             # Language can only be used with the ELEVENLABS_MULTILINGUAL_MODELS
             language = self._settings["language"]
             if model in ELEVENLABS_MULTILINGUAL_MODELS and language is not None:
@@ -339,8 +517,8 @@ class ElevenLabsTTSService(AudioContextWordTTSService):
                 )
 
             # Set max websocket message size to 16MB for large audio responses
-            self._websocket = await websockets.connect(
-                url, max_size=16 * 1024 * 1024, extra_headers={"xi-api-key": self._api_key}
+            self._websocket = await websocket_connect(
+                url, max_size=16 * 1024 * 1024, additional_headers={"xi-api-key": self._api_key}
             )
 
         except Exception as e:
@@ -358,6 +536,7 @@ class ElevenLabsTTSService(AudioContextWordTTSService):
                 if self._context_id:
                     await self._websocket.send(json.dumps({"close_socket": True}))
                 await self._websocket.close()
+                logger.debug("Disconnected from ElevenLabs")
         except Exception as e:
             logger.error(f"{self} error closing websocket: {e}")
         finally:
@@ -370,13 +549,20 @@ class ElevenLabsTTSService(AudioContextWordTTSService):
             return self._websocket
         raise Exception("Websocket not connected")
 
-    async def _handle_interruption(self, frame: StartInterruptionFrame, direction: FrameDirection):
+    async def _handle_interruption(self, frame: InterruptionFrame, direction: FrameDirection):
+        """Handle interruption by closing the current context."""
         await super()._handle_interruption(frame, direction)
 
         # Close the current context when interrupted without closing the websocket
         if self._context_id and self._websocket:
             logger.trace(f"Closing context {self._context_id} due to interruption")
             try:
+                # ElevenLabs requires that Pipecat manages the contexts and closes them
+                # when they're not longer in use. Since an InterruptionFrame is pushed
+                # every time the user speaks, we'll use this as a trigger to close the context
+                # and reset the state.
+                # Note: We do not need to call remove_audio_context here, as the context is
+                # automatically reset when super ()._handle_interruption is called.
                 await self._websocket.send(
                     json.dumps({"context_id": self._context_id, "close_context": True})
                 )
@@ -386,13 +572,32 @@ class ElevenLabsTTSService(AudioContextWordTTSService):
             self._started = False
 
     async def _receive_messages(self):
+        """Handle incoming WebSocket messages from ElevenLabs."""
         async for message in self._get_websocket():
             msg = json.loads(message)
-            # Check if this message belongs to the current context
+
             received_ctx_id = msg.get("contextId")
-            if not self.audio_context_available(received_ctx_id):
-                logger.trace(f"Ignoring message from unavailable context: {received_ctx_id}")
+
+            # Handle final messages first, regardless of context availability
+            # At the moment, this message is received AFTER the close_context message is
+            # sent, so it doesn't serve any functional purpose. For now, we'll just log it.
+            if msg.get("isFinal") is True:
+                logger.trace(f"Received final message for context {received_ctx_id}")
                 continue
+
+            # Check if this message belongs to the current context.
+            if not self.audio_context_available(received_ctx_id):
+                if self._context_id == received_ctx_id:
+                    logger.debug(
+                        f"Received a delayed message, recreating the context: {self._context_id}"
+                    )
+                    await self.create_audio_context(self._context_id)
+                else:
+                    # This can happen if a message is received _after_ we have closed a context
+                    # due to user interruption but _before_ the `isFinal` message for the context
+                    # is received.
+                    logger.debug(f"Ignoring message from unavailable context: {received_ctx_id}")
+                    continue
 
             if msg.get("audio"):
                 await self.stop_ttfb_metrics()
@@ -401,86 +606,109 @@ class ElevenLabsTTSService(AudioContextWordTTSService):
                 audio = base64.b64decode(msg["audio"])
                 frame = TTSAudioRawFrame(audio, self.sample_rate, 1)
                 await self.append_to_audio_context(received_ctx_id, frame)
+
             if msg.get("alignment"):
-                word_times = calculate_word_times(msg["alignment"], self._cumulative_time)
-                await self.add_word_timestamps(word_times)
-                self._cumulative_time = word_times[-1][1]
-            if msg.get("isFinal"):
-                logger.trace(f"Received final message for context {received_ctx_id}")
-                await self.remove_audio_context(received_ctx_id)
-                # Reset context tracking if this was our active context
-                if self._context_id == received_ctx_id:
-                    self._context_id = None
-                    self._started = False
+                alignment = msg["alignment"]
+                word_times = calculate_word_times(alignment, self._cumulative_time)
+
+                if word_times:
+                    await self.add_word_timestamps(word_times)
+
+                    # Calculate the actual end time of this audio chunk
+                    char_start_times_ms = alignment.get("charStartTimesMs", [])
+                    char_durations_ms = alignment.get("charDurationsMs", [])
+
+                    if char_start_times_ms and char_durations_ms:
+                        # End time = start time of last character + duration of last character
+                        chunk_end_time_ms = char_start_times_ms[-1] + char_durations_ms[-1]
+                        chunk_end_time_seconds = chunk_end_time_ms / 1000.0
+                        self._cumulative_time += chunk_end_time_seconds
+                    else:
+                        # Fallback: use the last word's start time (current behavior)
+                        self._cumulative_time = word_times[-1][1]
+                        logger.warning(
+                            "_receive_messages: using fallback timing method - consider investigating alignment data structure"
+                        )
 
     async def _keepalive_task_handler(self):
+        """Send periodic keepalive messages to maintain WebSocket connection."""
+        KEEPALIVE_SLEEP = 10
         while True:
-            await asyncio.sleep(10)
+            await asyncio.sleep(KEEPALIVE_SLEEP)
             try:
-                # Send an empty message to keep the connection alive
-                if self._websocket and self._websocket.open:
-                    await self._websocket.send(json.dumps({}))
+                if self._websocket and self._websocket.state is State.OPEN:
+                    if self._context_id:
+                        # Send keepalive with context ID to keep the connection alive
+                        keepalive_message = {
+                            "text": "",
+                            "context_id": self._context_id,
+                        }
+                        logger.trace(f"Sending keepalive for context {self._context_id}")
+                    else:
+                        # It's possible to have a user interruption which clears the context
+                        # without generating a new TTS response. In this case, we'll just send
+                        # an empty message to keep the connection alive.
+                        keepalive_message = {"text": ""}
+                        logger.trace("Sending keepalive without context")
+                    await self._websocket.send(json.dumps(keepalive_message))
             except websockets.ConnectionClosed as e:
                 logger.warning(f"{self} keepalive error: {e}")
                 break
 
     async def _send_text(self, text: str):
-        if self._websocket:
-            if not self._context_id:
-                # First message for a new context - need a space to initialize
-                msg = {"text": " ", "context_id": str(uuid.uuid4())}
-
-                # Add voice settings only in first message for a context
-                if self._voice_settings:
-                    msg["voice_settings"] = self._voice_settings
-
-                await self._websocket.send(json.dumps(msg))
-                self._context_id = msg["context_id"]
-                logger.trace(f"Created new context {self._context_id}")
-
-                # Now send the actual text content
-                msg = {"text": text, "context_id": self._context_id}
-                await self._websocket.send(json.dumps(msg))
-            else:
-                # Continuing with an existing context
-                msg = {"text": text, "context_id": self._context_id}
-                await self._websocket.send(json.dumps(msg))
+        """Send text to the WebSocket for synthesis."""
+        if self._websocket and self._context_id:
+            msg = {"text": text, "context_id": self._context_id}
+            await self._websocket.send(json.dumps(msg))
 
     @traced_tts
     async def run_tts(self, text: str) -> AsyncGenerator[Frame, None]:
+        """Generate speech from text using ElevenLabs' streaming WebSocket API.
+
+        Args:
+            text: The text to synthesize into speech.
+
+        Yields:
+            Frame: Audio frames containing the synthesized speech.
+        """
         logger.debug(f"{self}: Generating TTS [{text}]")
 
         try:
-            if not self._websocket or self._websocket.closed:
+            if not self._websocket or self._websocket.state is State.CLOSED:
                 await self._connect()
 
             try:
-                # Close previous context if there was one
-                if self._context_id and not self._started:
-                    await self._websocket.send(
-                        json.dumps({"context_id": self._context_id, "close_context": True})
-                    )
-                    await self.remove_audio_context(self._context_id)
-                    self._context_id = None
-
                 if not self._started:
                     await self.start_ttfb_metrics()
                     yield TTSStartedFrame()
                     self._started = True
                     self._cumulative_time = 0
-                    # Create new context ID and register it
-                    self._context_id = str(uuid.uuid4())
-                    await self.create_audio_context(self._context_id)
+                    # If a context ID does not exist, create a new one and
+                    # register it. If an ID exists, that means the Pipeline is
+                    # configured for allow_interruptions=False, so continue
+                    # using the current ID. When interruptions are enabled
+                    # (e.g. allow_interruptions=True), user speech results in
+                    # an interruption, which resets the context ID.
+                    if not self._context_id:
+                        self._context_id = str(uuid.uuid4())
+                    if not self.audio_context_available(self._context_id):
+                        await self.create_audio_context(self._context_id)
 
-                await self._send_text(text)
-                await self.start_tts_usage_metrics(text)
+                    # Initialize context with voice settings
+                    msg = {"text": " ", "context_id": self._context_id}
+                    if self._voice_settings:
+                        msg["voice_settings"] = self._voice_settings
+                    await self._websocket.send(json.dumps(msg))
+                    logger.trace(f"Created new context {self._context_id} with voice settings")
+
+                    await self._send_text(text)
+                    await self.start_tts_usage_metrics(text)
+                else:
+                    await self._send_text(text)
             except Exception as e:
                 logger.error(f"{self} error sending message: {e}")
                 yield TTSStoppedFrame()
                 self._started = False
-                if self._context_id:
-                    await self.remove_audio_context(self._context_id)
-                    self._context_id = None
                 return
             yield None
         except Exception as e:
@@ -488,19 +716,27 @@ class ElevenLabsTTSService(AudioContextWordTTSService):
 
 
 class ElevenLabsHttpTTSService(WordTTSService):
-    """ElevenLabs Text-to-Speech service using HTTP streaming with word timestamps.
+    """ElevenLabs HTTP-based TTS service with word timestamps.
 
-    Args:
-        api_key: ElevenLabs API key
-        voice_id: ID of the voice to use
-        aiohttp_session: aiohttp ClientSession
-        model: Model ID (default: "eleven_flash_v2_5" for low latency)
-        base_url: API base URL
-        sample_rate: Output sample rate
-        params: Additional parameters for voice configuration
+    Provides text-to-speech using ElevenLabs' HTTP streaming API for simpler,
+    non-WebSocket integration. Suitable for use cases where streaming WebSocket
+    connection is not required or desired.
     """
 
     class InputParams(BaseModel):
+        """Input parameters for ElevenLabs HTTP TTS configuration.
+
+        Parameters:
+            language: Language to use for synthesis.
+            optimize_streaming_latency: Latency optimization level (0-4).
+            stability: Voice stability control (0.0 to 1.0).
+            similarity_boost: Similarity boost control (0.0 to 1.0).
+            style: Style control for voice expression (0.0 to 1.0).
+            use_speaker_boost: Whether to use speaker boost enhancement.
+            speed: Voice speed control (0.25 to 4.0).
+            apply_text_normalization: Text normalization mode ("auto", "on", "off").
+        """
+
         language: Optional[Language] = None
         optimize_streaming_latency: Optional[int] = None
         stability: Optional[float] = None
@@ -508,6 +744,7 @@ class ElevenLabsHttpTTSService(WordTTSService):
         style: Optional[float] = None
         use_speaker_boost: Optional[bool] = None
         speed: Optional[float] = None
+        apply_text_normalization: Optional[Literal["auto", "on", "off"]] = None
 
     def __init__(
         self,
@@ -515,12 +752,24 @@ class ElevenLabsHttpTTSService(WordTTSService):
         api_key: str,
         voice_id: str,
         aiohttp_session: aiohttp.ClientSession,
-        model: str = "eleven_flash_v2_5",
+        model: str = "eleven_turbo_v2_5",
         base_url: str = "https://api.elevenlabs.io",
         sample_rate: Optional[int] = None,
         params: Optional[InputParams] = None,
         **kwargs,
     ):
+        """Initialize the ElevenLabs HTTP TTS service.
+
+        Args:
+            api_key: ElevenLabs API key for authentication.
+            voice_id: ID of the voice to use for synthesis.
+            aiohttp_session: aiohttp ClientSession for HTTP requests.
+            model: TTS model to use (e.g., "eleven_turbo_v2_5").
+            base_url: Base URL for ElevenLabs HTTP API.
+            sample_rate: Audio sample rate. If None, uses default.
+            params: Additional input parameters for voice customization.
+            **kwargs: Additional arguments passed to the parent service.
+        """
         super().__init__(
             aggregate_sentences=True,
             push_text_frames=False,
@@ -546,6 +795,7 @@ class ElevenLabsHttpTTSService(WordTTSService):
             "style": params.style,
             "use_speaker_boost": params.use_speaker_boost,
             "speed": params.speed,
+            "apply_text_normalization": params.apply_text_normalization,
         }
         self.set_model_name(model)
         self.set_voice(voice_id)
@@ -560,11 +810,22 @@ class ElevenLabsHttpTTSService(WordTTSService):
         self._previous_text = ""
 
     def language_to_service_language(self, language: Language) -> Optional[str]:
-        """Convert pipecat Language to ElevenLabs language code."""
+        """Convert pipecat Language to ElevenLabs language code.
+
+        Args:
+            language: The language to convert.
+
+        Returns:
+            The ElevenLabs-specific language code, or None if not supported.
+        """
         return language_to_elevenlabs_language(language)
 
     def can_generate_metrics(self) -> bool:
-        """Indicate that this service can generate usage metrics."""
+        """Check if this service can generate processing metrics.
+
+        Returns:
+            True, as ElevenLabs HTTP service supports metrics generation.
+        """
         return True
 
     def _set_voice_settings(self):
@@ -578,14 +839,24 @@ class ElevenLabsHttpTTSService(WordTTSService):
         logger.debug(f"{self}: Reset internal state")
 
     async def start(self, frame: StartFrame):
-        """Initialize the service upon receiving a StartFrame."""
+        """Start the ElevenLabs HTTP TTS service.
+
+        Args:
+            frame: The start frame containing initialization parameters.
+        """
         await super().start(frame)
         self._output_format = output_format_from_sample_rate(self.sample_rate)
         self._reset_state()
 
     async def push_frame(self, frame: Frame, direction: FrameDirection = FrameDirection.DOWNSTREAM):
+        """Push a frame and handle state changes.
+
+        Args:
+            frame: The frame to push.
+            direction: The direction to push the frame.
+        """
         await super().push_frame(frame, direction)
-        if isinstance(frame, (StartInterruptionFrame, TTSStoppedFrame)):
+        if isinstance(frame, (InterruptionFrame, TTSStoppedFrame)):
             # Reset timing on interruption or stop
             self._reset_state()
 
@@ -599,21 +870,23 @@ class ElevenLabsHttpTTSService(WordTTSService):
     def calculate_word_times(self, alignment_info: Mapping[str, Any]) -> List[Tuple[str, float]]:
         """Calculate word timing from character alignment data.
 
-        Example input data:
-        {
-            "characters": [" ", "H", "e", "l", "l", "o", " ", "w", "o", "r", "l", "d"],
-            "character_start_times_seconds": [0.0, 0.1, 0.15, 0.2, 0.25, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9],
-            "character_end_times_seconds": [0.1, 0.15, 0.2, 0.25, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
-        }
-
-        Would produce word times (with cumulative_time=0):
-        [("Hello", 0.1), ("world", 0.5)]
-
         Args:
-            alignment_info: Character timing data from ElevenLabs
+            alignment_info: Character timing data from ElevenLabs.
 
         Returns:
-            List of (word, timestamp) pairs
+            List of (word, timestamp) pairs.
+
+        Example input data::
+
+            {
+                "characters": [" ", "H", "e", "l", "l", "o", " ", "w", "o", "r", "l", "d"],
+                "character_start_times_seconds": [0.0, 0.1, 0.15, 0.2, 0.25, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9],
+                "character_end_times_seconds": [0.1, 0.15, 0.2, 0.25, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+            }
+
+        Would produce word times (with cumulative_time=0)::
+
+            [("Hello", 0.1), ("world", 0.5)]
         """
         chars = alignment_info.get("characters", [])
         char_start_times = alignment_info.get("character_start_times_seconds", [])
@@ -664,10 +937,10 @@ class ElevenLabsHttpTTSService(WordTTSService):
         Includes previous text as context for better prosody continuity.
 
         Args:
-            text: Text to convert to speech
+            text: Text to convert to speech.
 
         Yields:
-            Audio and control frames
+            Frame: Audio and control frames containing the synthesized speech.
         """
         logger.debug(f"{self}: Generating TTS [{text}]")
 
@@ -706,6 +979,8 @@ class ElevenLabsHttpTTSService(WordTTSService):
         }
         if self._settings["optimize_streaming_latency"] is not None:
             params["optimize_streaming_latency"] = self._settings["optimize_streaming_latency"]
+        if self._settings["apply_text_normalization"] is not None:
+            params["apply_text_normalization"] = self._settings["apply_text_normalization"]
 
         try:
             await self.start_ttfb_metrics()

@@ -4,6 +4,12 @@
 # SPDX-License-Identifier: BSD 2-Clause License
 #
 
+"""Base turn analyzer for determining end-of-turn in audio conversations.
+
+This module provides the abstract base class and enumeration for analyzing
+when a user has finished speaking in a conversation.
+"""
+
 from abc import ABC, abstractmethod
 from enum import Enum
 from typing import Optional, Tuple
@@ -12,6 +18,13 @@ from pipecat.metrics.metrics import MetricsData
 
 
 class EndOfTurnState(Enum):
+    """State enumeration for end-of-turn analysis results.
+
+    Parameters:
+        COMPLETE: The user has finished their turn and stopped speaking.
+        INCOMPLETE: The user is still speaking or may continue speaking.
+    """
+
     COMPLETE = 1
     INCOMPLETE = 2
 
@@ -24,6 +37,12 @@ class BaseTurnAnalyzer(ABC):
     """
 
     def __init__(self, *, sample_rate: Optional[int] = None):
+        """Initialize the turn analyzer.
+
+        Args:
+            sample_rate: Optional initial sample rate for audio processing.
+                If provided, this will be used as the fixed sample rate.
+        """
         self._init_sample_rate = sample_rate
         self._sample_rate = 0
 
@@ -57,6 +76,16 @@ class BaseTurnAnalyzer(ABC):
         """
         pass
 
+    @property
+    @abstractmethod
+    def params(self):
+        """Get the current turn analyzer parameters.
+
+        Returns:
+            Current turn analyzer configuration parameters.
+        """
+        pass
+
     @abstractmethod
     def append_audio(self, buffer: bytes, is_speech: bool) -> EndOfTurnState:
         """Appends audio data for analysis.
@@ -77,4 +106,9 @@ class BaseTurnAnalyzer(ABC):
         Returns:
             EndOfTurnState: The result of the end of turn analysis.
         """
+        pass
+
+    @abstractmethod
+    def clear(self):
+        """Reset the turn analyzer to its initial state."""
         pass

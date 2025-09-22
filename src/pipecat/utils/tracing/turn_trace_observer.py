@@ -4,6 +4,13 @@
 # SPDX-License-Identifier: BSD 2-Clause License
 #
 
+"""Turn trace observer for OpenTelemetry tracing in Pipecat.
+
+This module provides an observer that creates trace spans for each conversation
+turn, integrating with the turn tracking system to provide hierarchical tracing
+of conversation flows.
+"""
+
 from typing import TYPE_CHECKING, Dict, Optional
 
 from loguru import logger
@@ -35,8 +42,20 @@ class TurnTraceObserver(BaseObserver):
     """
 
     def __init__(
-        self, turn_tracker: TurnTrackingObserver, conversation_id: Optional[str] = None, **kwargs
+        self,
+        turn_tracker: TurnTrackingObserver,
+        conversation_id: Optional[str] = None,
+        additional_span_attributes: Optional[dict] = None,
+        **kwargs,
     ):
+        """Initialize the turn trace observer.
+
+        Args:
+            turn_tracker: The turn tracking observer to monitor.
+            conversation_id: Optional conversation ID for grouping turns.
+            additional_span_attributes: Additional attributes to add to spans.
+            **kwargs: Additional arguments passed to parent class.
+        """
         super().__init__(**kwargs)
         self._turn_tracker = turn_tracker
         self._current_span: Optional["Span"] = None
@@ -47,6 +66,7 @@ class TurnTraceObserver(BaseObserver):
         # Conversation tracking properties
         self._conversation_span: Optional["Span"] = None
         self._conversation_id = conversation_id
+        self._additional_span_attributes = additional_span_attributes or {}
 
         if turn_tracker:
 
@@ -63,6 +83,9 @@ class TurnTraceObserver(BaseObserver):
 
         This observer doesn't need to process individual frames as it
         relies on turn start/end events from the turn tracker.
+
+        Args:
+            data: The frame push event data.
         """
         pass
 
@@ -89,6 +112,9 @@ class TurnTraceObserver(BaseObserver):
         # Set span attributes
         self._conversation_span.set_attribute("conversation.id", conversation_id)
         self._conversation_span.set_attribute("conversation.type", "voice")
+        # Set custom otel attributes if provided
+        for k, v in (self._additional_span_attributes or {}).items():
+            self._conversation_span.set_attribute(k, v)
 
         # Update the conversation context provider
         context_provider.set_current_conversation_context(
@@ -190,6 +216,9 @@ class TurnTraceObserver(BaseObserver):
         """Get the span context for the current turn.
 
         This can be used by services to create child spans.
+
+        Returns:
+            The current turn's span context or None if not available.
         """
         if not is_tracing_available() or not self._current_span:
             return None
@@ -200,6 +229,12 @@ class TurnTraceObserver(BaseObserver):
         """Get the span context for a specific turn.
 
         This can be used by services to create child spans.
+
+        Args:
+            turn_number: The turn number to get context for.
+
+        Returns:
+            The specified turn's span context or None if not available.
         """
         if not is_tracing_available():
             return None

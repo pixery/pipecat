@@ -4,9 +4,12 @@
 # SPDX-License-Identifier: BSD 2-Clause License
 #
 
+"""OpenAI Realtime Beta LLM service implementation with WebSocket support."""
+
 import base64
 import json
 import time
+import warnings
 from dataclasses import dataclass
 from typing import Optional
 
@@ -21,6 +24,8 @@ from pipecat.frames.frames import (
     Frame,
     InputAudioRawFrame,
     InterimTranscriptionFrame,
+    InterruptionFrame,
+    LLMContextFrame,
     LLMFullResponseEndFrame,
     LLMFullResponseStartFrame,
     LLMMessagesAppendFrame,
@@ -28,8 +33,6 @@ from pipecat.frames.frames import (
     LLMTextFrame,
     LLMUpdateSettingsFrame,
     StartFrame,
-    StartInterruptionFrame,
-    StopInterruptionFrame,
     TranscriptionFrame,
     TTSAudioRawFrame,
     TTSStartedFrame,
@@ -52,7 +55,7 @@ from pipecat.services.llm_service import FunctionCallFromLLM, LLMService
 from pipecat.services.openai.llm import OpenAIContextAggregatorPair
 from pipecat.transcriptions.language import Language
 from pipecat.utils.time import time_now_iso8601
-from pipecat.utils.tracing.service_decorators import traced_openai_realtime, traced_stt, traced_tts
+from pipecat.utils.tracing.service_decorators import traced_openai_realtime, traced_stt
 
 from . import events
 from .context import (
@@ -63,7 +66,7 @@ from .context import (
 from .frames import RealtimeFunctionCallResultFrame, RealtimeMessagesUpdateFrame
 
 try:
-    import websockets
+    from websockets.asyncio.client import connect as websocket_connect
 except ModuleNotFoundError as e:
     logger.error(f"Exception: {e}")
     logger.error("In order to use OpenAI, you need to `pip install pipecat-ai[openai]`.")
@@ -72,6 +75,15 @@ except ModuleNotFoundError as e:
 
 @dataclass
 class CurrentAudioResponse:
+    """Tracks the current audio response from the assistant.
+
+    Parameters:
+        item_id: Unique identifier for the audio response item.
+        content_index: Index of the audio content within the item.
+        start_time_ms: Timestamp when the audio response started in milliseconds.
+        total_size: Total size of audio data received in bytes. Defaults to 0.
+    """
+
     item_id: str
     content_index: int
     start_time_ms: int
@@ -79,6 +91,17 @@ class CurrentAudioResponse:
 
 
 class OpenAIRealtimeBetaLLMService(LLMService):
+    """OpenAI Realtime Beta LLM service providing real-time audio and text communication.
+
+    .. deprecated:: 0.0.84
+        `OpenAIRealtimeBetaLLMService` is deprecated, use `OpenAIRealtimeLLMService` instead.
+        This class will be removed in version 1.0.0.
+
+    Implements the OpenAI Realtime API Beta with WebSocket communication for low-latency
+    bidirectional audio and text interactions. Supports function calling, conversation
+    management, and real-time transcription.
+    """
+
     # Overriding the default adapter to use the OpenAIRealtimeLLMAdapter one.
     adapter_class = OpenAIRealtimeLLMAdapter
 
@@ -86,13 +109,35 @@ class OpenAIRealtimeBetaLLMService(LLMService):
         self,
         *,
         api_key: str,
-        model: str = "gpt-4o-realtime-preview-2024-12-17",
+        model: str = "gpt-4o-realtime-preview-2025-06-03",
         base_url: str = "wss://api.openai.com/v1/realtime",
         session_properties: Optional[events.SessionProperties] = None,
         start_audio_paused: bool = False,
         send_transcription_frames: bool = True,
         **kwargs,
     ):
+        """Initialize the OpenAI Realtime Beta LLM service.
+
+        Args:
+            api_key: OpenAI API key for authentication.
+            model: OpenAI model name. Defaults to "gpt-4o-realtime-preview-2025-06-03".
+            base_url: WebSocket base URL for the realtime API.
+                Defaults to "wss://api.openai.com/v1/realtime".
+            session_properties: Configuration properties for the realtime session.
+                If None, uses default SessionProperties.
+            start_audio_paused: Whether to start with audio input paused. Defaults to False.
+            send_transcription_frames: Whether to emit transcription frames. Defaults to True.
+            **kwargs: Additional arguments passed to parent LLMService.
+        """
+        with warnings.catch_warnings():
+            warnings.simplefilter("always")
+            warnings.warn(
+                "OpenAIRealtimeBetaLLMService is deprecated and will be removed in version 1.0.0. "
+                "Use OpenAIRealtimeLLMService instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+
         full_url = f"{base_url}?model={model}"
         super().__init__(base_url=full_url, **kwargs)
 
@@ -124,12 +169,39 @@ class OpenAIRealtimeBetaLLMService(LLMService):
         self._retrieve_conversation_item_futures = {}
 
     def can_generate_metrics(self) -> bool:
+        """Check if the service can generate usage metrics.
+
+        Returns:
+            True if metrics generation is supported.
+        """
         return True
 
     def set_audio_input_paused(self, paused: bool):
+        """Set whether audio input is paused.
+
+        Args:
+            paused: True to pause audio input, False to resume.
+        """
         self._audio_input_paused = paused
 
+    def _is_modality_enabled(self, modality: str) -> bool:
+        """Check if a specific modality is enabled, "text" or "audio"."""
+        modalities = self._session_properties.modalities or ["audio", "text"]
+        return modality in modalities
+
+    def _get_enabled_modalities(self) -> list[str]:
+        """Get the list of enabled modalities."""
+        return self._session_properties.modalities or ["audio", "text"]
+
     async def retrieve_conversation_item(self, item_id: str):
+        """Retrieve a conversation item by ID from the server.
+
+        Args:
+            item_id: The ID of the conversation item to retrieve.
+
+        Returns:
+            The retrieved conversation item.
+        """
         future = self.get_event_loop().create_future()
         retrieval_in_flight = False
         if not self._retrieve_conversation_item_futures.get(item_id):
@@ -153,14 +225,29 @@ class OpenAIRealtimeBetaLLMService(LLMService):
     #
 
     async def start(self, frame: StartFrame):
+        """Start the service and establish WebSocket connection.
+
+        Args:
+            frame: The start frame triggering service initialization.
+        """
         await super().start(frame)
         await self._connect()
 
     async def stop(self, frame: EndFrame):
+        """Stop the service and close WebSocket connection.
+
+        Args:
+            frame: The end frame triggering service shutdown.
+        """
         await super().stop(frame)
         await self._disconnect()
 
     async def cancel(self, frame: CancelFrame):
+        """Cancel the service and close WebSocket connection.
+
+        Args:
+            frame: The cancel frame triggering service cancellation.
+        """
         await super().cancel(frame)
         await self._disconnect()
 
@@ -178,7 +265,9 @@ class OpenAIRealtimeBetaLLMService(LLMService):
         await self.stop_all_metrics()
         if self._current_assistant_response:
             await self.push_frame(LLMFullResponseEndFrame())
-            await self.push_frame(TTSStoppedFrame())
+            # Only push TTSStoppedFrame if audio modality is enabled
+            if self._is_modality_enabled("audio"):
+                await self.push_frame(TTSStoppedFrame())
 
     async def _handle_user_started_speaking(self, frame):
         pass
@@ -246,6 +335,12 @@ class OpenAIRealtimeBetaLLMService(LLMService):
     #
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
+        """Process incoming frames from the pipeline.
+
+        Args:
+            frame: The frame to process.
+            direction: The direction of frame flow in the pipeline.
+        """
         await super().process_frame(frame, direction)
 
         if isinstance(frame, TranscriptionFrame):
@@ -262,10 +357,14 @@ class OpenAIRealtimeBetaLLMService(LLMService):
                 await self.reset_conversation()
             # Run the LLM at next opportunity
             await self._create_response()
+        elif isinstance(frame, LLMContextFrame):
+            raise NotImplementedError(
+                "Universal LLMContext is not yet supported for OpenAI Realtime."
+            )
         elif isinstance(frame, InputAudioRawFrame):
             if not self._audio_input_paused:
                 await self._send_user_audio(frame)
-        elif isinstance(frame, StartInterruptionFrame):
+        elif isinstance(frame, InterruptionFrame):
             await self._handle_interruption()
         elif isinstance(frame, UserStartedSpeakingFrame):
             await self._handle_user_started_speaking(frame)
@@ -303,6 +402,11 @@ class OpenAIRealtimeBetaLLMService(LLMService):
     #
 
     async def send_client_event(self, event: events.ClientEvent):
+        """Send a client event to the OpenAI Realtime API.
+
+        Args:
+            event: The client event to send.
+        """
         await self._ws_send(event.model_dump(exclude_none=True))
 
     async def _connect(self):
@@ -311,9 +415,9 @@ class OpenAIRealtimeBetaLLMService(LLMService):
                 # Here we assume that if we have a websocket, we are connected. We
                 # handle disconnections in the send/recv code paths.
                 return
-            self._websocket = await websockets.connect(
+            self._websocket = await websocket_connect(
                 uri=self.base_url,
-                extra_headers={
+                additional_headers={
                     "Authorization": f"Bearer {self.api_key}",
                     "OpenAI-Beta": "realtime=v1",
                 },
@@ -393,6 +497,8 @@ class OpenAIRealtimeBetaLLMService(LLMService):
                 await self._handle_evt_speech_started(evt)
             elif evt.type == "input_audio_buffer.speech_stopped":
                 await self._handle_evt_speech_stopped(evt)
+            elif evt.type == "response.text.delta":
+                await self._handle_evt_text_delta(evt)
             elif evt.type == "response.audio_transcript.delta":
                 await self._handle_evt_audio_transcript_delta(evt)
             elif evt.type == "error":
@@ -475,6 +581,11 @@ class OpenAIRealtimeBetaLLMService(LLMService):
         pass
 
     async def handle_evt_input_audio_transcription_completed(self, evt):
+        """Handle completion of input audio transcription.
+
+        Args:
+            evt: The transcription completed event.
+        """
         await self._call_event_handler("on_conversation_item_updated", evt.item_id, None)
 
         if self._send_transcription_frames:
@@ -536,6 +647,10 @@ class OpenAIRealtimeBetaLLMService(LLMService):
             # Response message without preceding user message. Add it to the context.
             await self._handle_assistant_output(evt.response.output)
 
+    async def _handle_evt_text_delta(self, evt):
+        if evt.delta:
+            await self.push_frame(LLMTextFrame(evt.delta))
+
     async def _handle_evt_audio_transcript_delta(self, evt):
         if evt.delta:
             await self.push_frame(LLMTextFrame(evt.delta))
@@ -543,19 +658,19 @@ class OpenAIRealtimeBetaLLMService(LLMService):
 
     async def _handle_evt_speech_started(self, evt):
         await self._truncate_current_audio_response()
-        await self._start_interruption()  # cancels this processor task
-        await self.push_frame(StartInterruptionFrame())  # cancels downstream tasks
+        await self.push_interruption_task_frame_and_wait()
         await self.push_frame(UserStartedSpeakingFrame())
 
     async def _handle_evt_speech_stopped(self, evt):
         await self.start_ttfb_metrics()
         await self.start_processing_metrics()
-        await self._stop_interruption()
-        await self.push_frame(StopInterruptionFrame())
         await self.push_frame(UserStoppedSpeakingFrame())
 
     async def _maybe_handle_evt_retrieve_conversation_item_error(self, evt: events.ErrorEvent):
-        """If the given error event is an error retrieving a conversation item:
+        """Maybe handle an error event related to retrieving a conversation item.
+
+        If the given error event is an error retrieving a conversation item:
+
         - set an exception on the future that retrieve_conversation_item() is waiting on
         - return true
         Otherwise:
@@ -602,8 +717,11 @@ class OpenAIRealtimeBetaLLMService(LLMService):
     #
 
     async def reset_conversation(self):
-        # Disconnect/reconnect is the safest way to start a new conversation.
-        # Note that this will fail if called from the receive task.
+        """Reset the conversation by disconnecting and reconnecting.
+
+        This is the safest way to start a new conversation. Note that this will
+        fail if called from the receive task.
+        """
         logger.debug("Resetting conversation")
         await self._disconnect()
         if self._context:
@@ -636,7 +754,7 @@ class OpenAIRealtimeBetaLLMService(LLMService):
         await self.start_ttfb_metrics()
         await self.send_client_event(
             events.ResponseCreateEvent(
-                response=events.ResponseProperties(modalities=["audio", "text"])
+                response=events.ResponseProperties(modalities=self._get_enabled_modalities())
             )
         )
 
@@ -651,22 +769,19 @@ class OpenAIRealtimeBetaLLMService(LLMService):
         user_params: LLMUserAggregatorParams = LLMUserAggregatorParams(),
         assistant_params: LLMAssistantAggregatorParams = LLMAssistantAggregatorParams(),
     ) -> OpenAIContextAggregatorPair:
-        """Create an instance of OpenAIContextAggregatorPair from an
-        OpenAILLMContext. Constructor keyword arguments for both the user and
-        assistant aggregators can be provided.
+        """Create an instance of OpenAIContextAggregatorPair from an OpenAILLMContext.
+
+        Constructor keyword arguments for both the user and assistant aggregators can be provided.
 
         Args:
-            context (OpenAILLMContext): The LLM context.
-            user_params (LLMUserAggregatorParams, optional): User aggregator
-                parameters.
-            assistant_params (LLMAssistantAggregatorParams, optional): User
-                aggregator parameters.
+            context: The LLM context.
+            user_params: User aggregator parameters.
+            assistant_params: Assistant aggregator parameters.
 
         Returns:
             OpenAIContextAggregatorPair: A pair of context aggregators, one for
             the user and one for the assistant, encapsulated in an
             OpenAIContextAggregatorPair.
-
         """
         context.set_llm_adapter(self.get_llm_adapter())
 

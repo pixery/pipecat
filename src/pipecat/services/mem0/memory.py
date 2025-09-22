@@ -4,6 +4,13 @@
 # SPDX-License-Identifier: BSD 2-Clause License
 #
 
+"""Mem0 memory service integration for Pipecat.
+
+This module provides a memory service that integrates with Mem0 to store
+and retrieve conversational memories, enhancing LLM context with relevant
+historical information.
+"""
+
 from typing import Any, Dict, List, Optional
 
 from loguru import logger
@@ -31,14 +38,21 @@ class Mem0MemoryService(FrameProcessor):
 
     This service intercepts message frames in the pipeline, stores them in Mem0,
     and enhances context with relevant memories before passing them downstream.
-
-    Args:
-        api_key (str): The API key for accessing Mem0's API
-        user_id (str): The user ID to associate with memories in Mem0
-        params (InputParams, optional): Configuration parameters for memory retrieval
+    Supports both local and cloud-based Mem0 configurations.
     """
 
     class InputParams(BaseModel):
+        """Configuration parameters for Mem0 memory service.
+
+        Parameters:
+            search_limit: Maximum number of memories to retrieve per query.
+            search_threshold: Minimum similarity threshold for memory retrieval.
+            api_version: API version to use for Mem0 client operations.
+            system_prompt: Prefix text for memory context messages.
+            add_as_system_message: Whether to add memories as system messages.
+            position: Position to insert memory messages in context.
+        """
+
         search_limit: int = Field(default=10, ge=1)
         search_threshold: float = Field(default=0.1, ge=0.0, le=1.0)
         api_version: str = Field(default="v2")
@@ -55,7 +69,22 @@ class Mem0MemoryService(FrameProcessor):
         agent_id: Optional[str] = None,
         run_id: Optional[str] = None,
         params: Optional[InputParams] = None,
+        host: Optional[str] = None,
     ):
+        """Initialize the Mem0 memory service.
+
+        Args:
+            api_key: The API key for accessing Mem0's cloud API.
+            local_config: Local configuration for Mem0 client (alternative to cloud API).
+            user_id: The user ID to associate with memories in Mem0.
+            agent_id: The agent ID to associate with memories in Mem0.
+            run_id: The run ID to associate with memories in Mem0.
+            params: Configuration parameters for memory retrieval and storage.
+            host: The host of the Mem0 server.
+
+        Raises:
+            ValueError: If none of user_id, agent_id, or run_id are provided.
+        """
         # Important: Call the parent class __init__ first
         super().__init__()
 
@@ -65,7 +94,7 @@ class Mem0MemoryService(FrameProcessor):
         if local_config:
             self.memory_client = Memory.from_config(local_config)
         else:
-            self.memory_client = MemoryClient(api_key=api_key)
+            self.memory_client = MemoryClient(api_key=api_key, host=host)
         # At least one of user_id, agent_id, or run_id must be provided
         if not any([user_id, agent_id, run_id]):
             raise ValueError("At least one of user_id, agent_id, or run_id must be provided")
@@ -86,11 +115,12 @@ class Mem0MemoryService(FrameProcessor):
         """Store messages in Mem0.
 
         Args:
-            messages: List of message dictionaries to store
+            messages: List of message dictionaries to store in memory.
         """
         try:
             logger.debug(f"Storing {len(messages)} messages in Mem0")
             params = {
+                "async_mode": True,
                 "messages": messages,
                 "metadata": {"platform": "pipecat"},
                 "output_format": "v1.1",
@@ -110,10 +140,10 @@ class Mem0MemoryService(FrameProcessor):
         """Retrieve relevant memories from Mem0.
 
         Args:
-            query: The query to search for relevant memories
+            query: The query to search for relevant memories.
 
         Returns:
-            List of relevant memory dictionaries
+            List of relevant memory dictionaries matching the query.
         """
         try:
             logger.debug(f"Retrieving memories for query: {query}")
@@ -134,7 +164,7 @@ class Mem0MemoryService(FrameProcessor):
                     ("run_id", self.run_id),
                 ]
                 clauses = [{name: value} for name, value in id_pairs if value is not None]
-                filters = {"AND": clauses} if clauses else {}
+                filters = {"OR": clauses} if clauses else {}
                 results = self.memory_client.search(
                     query=query,
                     filters=filters,
@@ -154,8 +184,8 @@ class Mem0MemoryService(FrameProcessor):
         """Enhance the LLM context with relevant memories.
 
         Args:
-            context: The OpenAILLMContext to enhance
-            query: The query to search for relevant memories
+            context: The OpenAILLMContext to enhance with memory information.
+            query: The query to search for relevant memories.
         """
         # Skip if this is the same query we just processed
         if self.last_query == query:
@@ -184,8 +214,8 @@ class Mem0MemoryService(FrameProcessor):
         """Process incoming frames, intercept context frames for memory integration.
 
         Args:
-            frame: The incoming frame to process
-            direction: The direction of frame flow in the pipeline
+            frame: The incoming frame to process.
+            direction: The direction of frame flow in the pipeline.
         """
         await super().process_frame(frame, direction)
 
