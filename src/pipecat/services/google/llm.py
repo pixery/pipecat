@@ -71,6 +71,9 @@ try:
         GenerateContentResponse,
         HttpOptions,
         Part,
+        SafetySetting,
+        HarmCategory,
+        HarmBlockThreshold,
     )
 except ModuleNotFoundError as e:
     logger.error(f"Exception: {e}")
@@ -168,7 +171,7 @@ class GoogleAssistantContextAggregator(OpenAIAssistantContextAggregator):
         )
 
     async def _update_function_call_result(
-        self, function_name: str, tool_call_id: str, result: Any
+            self, function_name: str, tool_call_id: str, result: Any
     ):
         for message in self._context.messages:
             if message.role == "user":
@@ -230,10 +233,10 @@ class GoogleLLMContext(OpenAILLMContext):
     """
 
     def __init__(
-        self,
-        messages: Optional[List[dict]] = None,
-        tools: Optional[List[dict]] = None,
-        tool_choice: Optional[dict] = None,
+            self,
+            messages: Optional[List[dict]] = None,
+            tools: Optional[List[dict]] = None,
+            tool_choice: Optional[dict] = None,
     ):
         """Initialize GoogleLLMContext.
 
@@ -311,7 +314,7 @@ class GoogleLLMContext(OpenAILLMContext):
         return msgs
 
     def add_image_frame_message(
-        self, *, format: str, size: tuple[int, int], image: bytes, text: str = None
+            self, *, format: str, size: tuple[int, int], image: bytes, text: str = None
     ):
         """Add an image message to the context.
 
@@ -332,7 +335,7 @@ class GoogleLLMContext(OpenAILLMContext):
         self.add_message(Content(role="user", parts=parts))
 
     def add_audio_frames_message(
-        self, *, audio_frames: list[AudioRawFrame], text: str = "Audio follows"
+            self, *, audio_frames: list[AudioRawFrame], text: str = "Audio follows"
     ):
         """Add audio frames as a message to the context.
 
@@ -679,16 +682,16 @@ class GoogleLLMService(LLMService):
         extra: Optional[Dict[str, Any]] = Field(default_factory=dict)
 
     def __init__(
-        self,
-        *,
-        api_key: str,
-        model: str = "gemini-2.0-flash",
-        params: Optional[InputParams] = None,
-        system_instruction: Optional[str] = None,
-        tools: Optional[List[Dict[str, Any]]] = None,
-        tool_config: Optional[Dict[str, Any]] = None,
-        http_options: Optional[HttpOptions] = None,
-        **kwargs,
+            self,
+            *,
+            api_key: str,
+            model: str = "gemini-2.0-flash",
+            params: Optional[InputParams] = None,
+            system_instruction: Optional[str] = None,
+            tools: Optional[List[Dict[str, Any]]] = None,
+            tool_config: Optional[Dict[str, Any]] = None,
+            http_options: Optional[HttpOptions] = None,
+            **kwargs,
     ):
         """Initialize the Google LLM service.
 
@@ -718,6 +721,13 @@ class GoogleLLMService(LLMService):
             "top_p": params.top_p,
             "extra": params.extra if isinstance(params.extra, dict) else {},
         }
+        self._safety_settings = [
+            SafetySetting(category=HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold=HarmBlockThreshold.BLOCK_NONE),
+            SafetySetting(category=HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold=HarmBlockThreshold.BLOCK_NONE),
+            SafetySetting(category=HarmCategory.HARM_CATEGORY_HARASSMENT, threshold=HarmBlockThreshold.BLOCK_NONE),
+            SafetySetting(category=HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, threshold=HarmBlockThreshold.BLOCK_NONE),
+            SafetySetting(category=HarmCategory.HARM_CATEGORY_CIVIC_INTEGRITY, threshold=HarmBlockThreshold.BLOCK_NONE),
+        ]
         self._tools = tools
         self._tool_config = tool_config
 
@@ -753,7 +763,7 @@ class GoogleLLMService(LLMService):
             messages = context.messages
             system = getattr(context, "system_message", None)
 
-        generation_config = GenerateContentConfig(system_instruction=system)
+        generation_config = GenerateContentConfig(system_instruction=system, safety_settings=self._safety_settings)
 
         # Use the new google-genai client's async method
         response = await self._client.aio.models.generate_content(
@@ -796,12 +806,12 @@ class GoogleLLMService(LLMService):
             logger.exception(f"Failed to unset thinking budget: {e}")
 
     async def _stream_content(
-        self, params_from_context: GeminiLLMInvocationParams
+            self, params_from_context: GeminiLLMInvocationParams
     ) -> AsyncIterator[GenerateContentResponse]:
         messages = params_from_context["messages"]
         if (
-            params_from_context["system_instruction"]
-            and self._system_instruction != params_from_context["system_instruction"]
+                params_from_context["system_instruction"]
+                and self._system_instruction != params_from_context["system_instruction"]
         ):
             logger.debug(f"System instruction changed: {params_from_context['system_instruction']}")
             self._system_instruction = params_from_context["system_instruction"]
@@ -826,6 +836,7 @@ class GoogleLLMService(LLMService):
                 "max_output_tokens": self._settings["max_tokens"],
                 "tools": tools,
                 "tool_config": tool_config,
+                "safety_settings": self._safety_settings,
             }.items()
             if v is not None
         }
@@ -848,7 +859,7 @@ class GoogleLLMService(LLMService):
         )
 
     async def _stream_content_specific_context(
-        self, context: OpenAILLMContext
+            self, context: OpenAILLMContext
     ) -> AsyncIterator[GenerateContentResponse]:
         logger.debug(
             f"{self}: Generating chat from LLM-specific context [{context.system_message}] | {context.get_messages_for_logging()}"
@@ -863,7 +874,7 @@ class GoogleLLMService(LLMService):
         return await self._stream_content(params)
 
     async def _stream_content_universal_context(
-        self, context: LLMContext
+            self, context: LLMContext
     ) -> AsyncIterator[GenerateContentResponse]:
         adapter = self.get_llm_adapter()
         params: GeminiLLMInvocationParams = adapter.get_llm_invocation_params(context)
@@ -929,8 +940,8 @@ class GoogleLLMService(LLMService):
                                 )
 
                     if (
-                        candidate.grounding_metadata
-                        and candidate.grounding_metadata.grounding_chunks
+                            candidate.grounding_metadata
+                            and candidate.grounding_metadata.grounding_chunks
                     ):
                         m = candidate.grounding_metadata
                         rendered_content = (
@@ -955,7 +966,7 @@ class GoogleLLMService(LLMService):
                                         m.grounding_supports if m.grounding_supports else []
                                     )
                                     if grounding_support.grounding_chunk_indices
-                                    and index in grounding_support.grounding_chunk_indices
+                                       and index in grounding_support.grounding_chunk_indices
                                 ],
                             }
                             for index, grounding_chunk in enumerate(
@@ -1021,11 +1032,11 @@ class GoogleLLMService(LLMService):
             await self._process_context(context)
 
     def create_context_aggregator(
-        self,
-        context: OpenAILLMContext,
-        *,
-        user_params: LLMUserAggregatorParams = LLMUserAggregatorParams(),
-        assistant_params: LLMAssistantAggregatorParams = LLMAssistantAggregatorParams(),
+            self,
+            context: OpenAILLMContext,
+            *,
+            user_params: LLMUserAggregatorParams = LLMUserAggregatorParams(),
+            assistant_params: LLMAssistantAggregatorParams = LLMAssistantAggregatorParams(),
     ) -> GoogleContextAggregatorPair:
         """Create Google-specific context aggregators.
 
