@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2024-2025 Daily
+# Copyright (c) 2024-2026, Daily
 #
 # SPDX-License-Identifier: BSD 2-Clause License
 #
@@ -7,12 +7,14 @@
 """Tests for PiperTTSService."""
 
 import asyncio
+import unittest
 
 import aiohttp
 import pytest
 from aiohttp import web
 
 from pipecat.frames.frames import (
+    AggregatedTextFrame,
     ErrorFrame,
     TTSAudioRawFrame,
     TTSSpeakFrame,
@@ -20,7 +22,7 @@ from pipecat.frames.frames import (
     TTSStoppedFrame,
     TTSTextFrame,
 )
-from pipecat.services.piper.tts import PiperTTSService
+from pipecat.services.piper.tts import PiperHttpTTSService
 from pipecat.tests.utils import run_test
 
 
@@ -66,14 +68,17 @@ async def test_run_piper_tts_success(aiohttp_client):
     base_url = str(client.make_url("")).rstrip("/")
 
     async with aiohttp.ClientSession() as session:
-        # Instantiate PiperTTSService with our mock server
-        tts_service = PiperTTSService(base_url=base_url, aiohttp_session=session, sample_rate=24000)
+        # Instantiate PiperHttpTTSService with our mock server
+        tts_service = PiperHttpTTSService(
+            base_url=base_url, aiohttp_session=session, sample_rate=24000
+        )
 
         frames_to_send = [
             TTSSpeakFrame(text="Hello world."),
         ]
 
         expected_returned_frames = [
+            AggregatedTextFrame,
             TTSStartedFrame,
             TTSAudioRawFrame,
             TTSAudioRawFrame,
@@ -115,13 +120,15 @@ async def test_run_piper_tts_error(aiohttp_client):
     base_url = str(client.make_url("")).rstrip("/")
 
     async with aiohttp.ClientSession() as session:
-        tts_service = PiperTTSService(base_url=base_url, aiohttp_session=session, sample_rate=24000)
+        tts_service = PiperHttpTTSService(
+            base_url=base_url, aiohttp_session=session, sample_rate=24000
+        )
 
         frames_to_send = [
-            TTSSpeakFrame(text="Error case."),
+            TTSSpeakFrame(text="Error case.", append_to_context=False),
         ]
 
-        expected_down_frames = [TTSStoppedFrame, TTSTextFrame]
+        expected_down_frames = [AggregatedTextFrame, TTSStoppedFrame, TTSTextFrame]
 
         expected_up_frames = [ErrorFrame]
 
@@ -137,3 +144,7 @@ async def test_run_piper_tts_error(aiohttp_client):
         assert "status: 404" in up_frames[0].error, (
             "ErrorFrame should contain details about the 404"
         )
+
+
+if __name__ == "__main__":
+    unittest.main()

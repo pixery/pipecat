@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2024–2025, Daily
+# Copyright (c) 2024-2026, Daily
 #
 # SPDX-License-Identifier: BSD 2-Clause License
 #
@@ -11,19 +11,23 @@ Speech SDK for real-time audio transcription.
 """
 
 import asyncio
-from typing import AsyncGenerator, Optional
+from dataclasses import dataclass, field
+from typing import Any, AsyncGenerator, Optional
 
 from loguru import logger
 
 from pipecat.frames.frames import (
     CancelFrame,
     EndFrame,
+    ErrorFrame,
     Frame,
     InterimTranscriptionFrame,
     StartFrame,
     TranscriptionFrame,
 )
 from pipecat.services.azure.common import language_to_azure_language
+from pipecat.services.settings import NOT_GIVEN, STTSettings, _NotGiven
+from pipecat.services.stt_latency import AZURE_TTFS_P99
 from pipecat.services.stt_service import STTService
 from pipecat.transcriptions.language import Language
 from pipecat.utils.time import time_now_iso8601
@@ -31,6 +35,7 @@ from pipecat.utils.tracing.service_decorators import traced_stt
 
 try:
     from azure.cognitiveservices.speech import (
+        CancellationReason,
         ResultReason,
         SpeechConfig,
         SpeechRecognizer,
@@ -46,6 +51,19 @@ except ModuleNotFoundError as e:
     raise Exception(f"Missing module: {e}")
 
 
+@dataclass
+class AzureSTTSettings(STTSettings):
+    """Settings for the Azure STT service.
+
+    Parameters:
+        region: Azure region for the Speech service.
+        sample_rate: Audio sample rate in Hz.
+    """
+
+    region: str | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    sample_rate: int | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
+
+
 class AzureSTTService(STTService):
     """Azure Speech-to-Text service for real-time audio transcription.
 
@@ -54,6 +72,8 @@ class AzureSTTService(STTService):
     provides real-time transcription results with timing information.
     """
 
+    _settings: AzureSTTSettings
+
     def __init__(
         self,
         *,
@@ -61,7 +81,9 @@ class AzureSTTService(STTService):
         region: str,
         language: Language = Language.EN_US,
         sample_rate: Optional[int] = None,
+        private_endpoint: Optional[str] = None,
         endpoint_id: Optional[str] = None,
+        ttfs_p99_latency: Optional[float] = AZURE_TTFS_P99,
         **kwargs,
     ):
         """Initialize the Azure STT service.
@@ -71,15 +93,30 @@ class AzureSTTService(STTService):
             region: Azure region for the Speech service (e.g., 'eastus').
             language: Language for speech recognition. Defaults to English (US).
             sample_rate: Audio sample rate in Hz. If None, uses service default.
+            private_endpoint: Private endpoint for STT behind firewall.
+                See https://docs.azure.cn/en-us/ai-services/speech-service/speech-services-private-link?tabs=portal
             endpoint_id: Custom model endpoint id.
+            ttfs_p99_latency: P99 latency from speech end to final transcript in seconds.
+                Override for your deployment. See https://github.com/pipecat-ai/stt-benchmark
             **kwargs: Additional arguments passed to parent STTService.
         """
-        super().__init__(sample_rate=sample_rate, **kwargs)
+        super().__init__(
+            sample_rate=sample_rate,
+            ttfs_p99_latency=ttfs_p99_latency,
+            settings=AzureSTTSettings(
+                model=None,
+                region=region,
+                language=language_to_azure_language(language),
+                sample_rate=sample_rate,
+            ),
+            **kwargs,
+        )
 
         self._speech_config = SpeechConfig(
             subscription=api_key,
             region=region,
             speech_recognition_language=language_to_azure_language(language),
+            endpoint=private_endpoint,
         )
 
         if endpoint_id:
@@ -87,11 +124,6 @@ class AzureSTTService(STTService):
 
         self._audio_stream = None
         self._speech_recognizer = None
-        self._settings = {
-            "region": region,
-            "language": language_to_azure_language(language),
-            "sample_rate": sample_rate,
-        }
 
     def can_generate_metrics(self) -> bool:
         """Check if this service can generate performance metrics.
@@ -100,6 +132,38 @@ class AzureSTTService(STTService):
             True as this service supports metrics generation.
         """
         return True
+
+    def language_to_service_language(self, language: Language) -> Optional[str]:
+        """Convert a Language enum to Azure service-specific language code.
+
+        Args:
+            language: The language to convert.
+
+        Returns:
+            The Azure-specific language identifier, or None if not supported.
+        """
+        return language_to_azure_language(language)
+
+    async def _update_settings(self, delta: STTSettings) -> dict[str, Any]:
+        """Apply a settings delta.
+
+        Settings are stored but not applied to the active recognizer.
+        """
+        changed = await super()._update_settings(delta)
+
+        # TODO: someday we could reconnect here to apply updated settings.
+        # Code might look something like the below:
+        # if "language" in changed:
+        #     self._speech_config.speech_recognition_language = self._settings.language
+        #     if self._speech_recognizer:
+        #         # Requires refactoring to set up and tear down recognizer, as
+        #         # language is applied at recognizer initialization
+        #         await self._disconnect()
+        #         await self._connect()
+
+        self._warn_unhandled_updated_settings(changed)
+
+        return changed
 
     async def run_stt(self, audio: bytes) -> AsyncGenerator[Frame, None]:
         """Process audio data for speech-to-text conversion.
@@ -111,13 +175,15 @@ class AzureSTTService(STTService):
             audio: Raw audio bytes to process.
 
         Yields:
-            None - actual transcription frames are pushed via callbacks.
+            Frame: Either None for successful processing or ErrorFrame on failure.
         """
-        await self.start_processing_metrics()
-        await self.start_ttfb_metrics()
-        if self._audio_stream:
-            self._audio_stream.write(audio)
-        yield None
+        try:
+            await self.start_processing_metrics()
+            if self._audio_stream:
+                self._audio_stream.write(audio)
+            yield None
+        except Exception as e:
+            yield ErrorFrame(error=f"Unknown error occurred: {e}")
 
     async def start(self, frame: StartFrame):
         """Start the speech recognition service.
@@ -133,17 +199,23 @@ class AzureSTTService(STTService):
         if self._audio_stream:
             return
 
-        stream_format = AudioStreamFormat(samples_per_second=self.sample_rate, channels=1)
-        self._audio_stream = PushAudioInputStream(stream_format)
+        try:
+            stream_format = AudioStreamFormat(samples_per_second=self.sample_rate, channels=1)
+            self._audio_stream = PushAudioInputStream(stream_format)
 
-        audio_config = AudioConfig(stream=self._audio_stream)
+            audio_config = AudioConfig(stream=self._audio_stream)
 
-        self._speech_recognizer = SpeechRecognizer(
-            speech_config=self._speech_config, audio_config=audio_config
-        )
-        self._speech_recognizer.recognizing.connect(self._on_handle_recognizing)
-        self._speech_recognizer.recognized.connect(self._on_handle_recognized)
-        self._speech_recognizer.start_continuous_recognition_async()
+            self._speech_recognizer = SpeechRecognizer(
+                speech_config=self._speech_config, audio_config=audio_config
+            )
+            self._speech_recognizer.recognizing.connect(self._on_handle_recognizing)
+            self._speech_recognizer.recognized.connect(self._on_handle_recognized)
+            self._speech_recognizer.canceled.connect(self._on_handle_canceled)
+            self._speech_recognizer.start_continuous_recognition_async()
+        except Exception as e:
+            await self.push_error(
+                error_msg=f"Uncaught exception during initialization: {e}", exception=e
+            )
 
     async def stop(self, frame: EndFrame):
         """Stop the speech recognition service.
@@ -182,12 +254,11 @@ class AzureSTTService(STTService):
         self, transcript: str, is_final: bool, language: Optional[Language] = None
     ):
         """Handle a transcription result with tracing."""
-        await self.stop_ttfb_metrics()
         await self.stop_processing_metrics()
 
     def _on_handle_recognized(self, event):
         if event.result.reason == ResultReason.RecognizedSpeech and len(event.result.text) > 0:
-            language = getattr(event.result, "language", None) or self._settings.get("language")
+            language = getattr(event.result, "language", None) or self._settings.language
             frame = TranscriptionFrame(
                 event.result.text,
                 self._user_id,
@@ -202,7 +273,7 @@ class AzureSTTService(STTService):
 
     def _on_handle_recognizing(self, event):
         if event.result.reason == ResultReason.RecognizingSpeech and len(event.result.text) > 0:
-            language = getattr(event.result, "language", None) or self._settings.get("language")
+            language = getattr(event.result, "language", None) or self._settings.language
             frame = InterimTranscriptionFrame(
                 event.result.text,
                 self._user_id,
@@ -211,3 +282,13 @@ class AzureSTTService(STTService):
                 result=event,
             )
             asyncio.run_coroutine_threadsafe(self.push_frame(frame), self.get_event_loop())
+
+    def _on_handle_canceled(self, event):
+        details = event.result.cancellation_details
+        if details.reason == CancellationReason.Error:
+            error_msg = f"Azure STT recognition canceled: {details.reason}"
+            if details.error_details:
+                error_msg += f" - {details.error_details}"
+            asyncio.run_coroutine_threadsafe(
+                self.push_error(error_msg=error_msg), self.get_event_loop()
+            )

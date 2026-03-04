@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2024–2025, Daily
+# Copyright (c) 2024-2026, Daily
 #
 # SPDX-License-Identifier: BSD 2-Clause License
 #
@@ -7,10 +7,8 @@
 """OpenAI LLM adapter for Pipecat."""
 
 import copy
-import json
 from typing import Any, Dict, List, TypedDict
 
-from openai._types import NOT_GIVEN as OPEN_AI_NOT_GIVEN
 from openai._types import NotGiven as OpenAINotGiven
 from openai.types.chat import (
     ChatCompletionMessageParam,
@@ -105,6 +103,8 @@ class OpenAILLMAdapter(BaseLLMAdapter[OpenAILLMInvocationParams]):
                         if item["type"] == "image_url":
                             if item["image_url"]["url"].startswith("data:image/"):
                                 item["image_url"]["url"] = "data:image/..."
+                        if item["type"] == "input_audio":
+                            item["input_audio"]["data"] = "..."
             if "mime_type" in msg and msg["mime_type"].startswith("image/"):
                 msg["data"] = "..."
             msgs.append(msg)

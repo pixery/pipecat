@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2024–2025, Daily
+# Copyright (c) 2024-2026, Daily
 #
 # SPDX-License-Identifier: BSD 2-Clause License
 #
@@ -14,6 +14,7 @@ from loguru import logger
 from pipecat.frames.frames import (
     DataFrame,
     Frame,
+    LLMContextFrame,
     LLMFullResponseStartFrame,
     TextFrame,
 )
@@ -21,10 +22,7 @@ from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.sync_parallel_pipeline import SyncParallelPipeline
 from pipecat.pipeline.task import PipelineTask
-from pipecat.processors.aggregators.openai_llm_context import (
-    OpenAILLMContext,
-    OpenAILLMContextFrame,
-)
+from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.sentence import SentenceAggregator
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.runner.types import RunnerArguments
@@ -67,9 +65,8 @@ class MonthPrepender(FrameProcessor):
             await self.push_frame(frame, direction)
 
 
-# We store functions so objects (e.g. SileroVADAnalyzer) don't get
-# instantiated. The function will be called when the desired transport gets
-# selected.
+# We use lambdas to defer transport parameter creation until the transport
+# type is selected at runtime.
 transport_params = {
     "daily": lambda: DailyParams(
         audio_out_enabled=True,
@@ -156,7 +153,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
                 }
             ]
             frames.append(MonthFrame(month=month))
-            frames.append(OpenAILLMContextFrame(OpenAILLMContext(messages)))
+            frames.append(LLMContextFrame(LLMContext(messages)))
 
         task = PipelineTask(
             pipeline,

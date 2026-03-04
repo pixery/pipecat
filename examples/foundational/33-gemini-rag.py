@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2024–2025, Daily
+# Copyright (c) 2024-2026, Daily
 #
 # SPDX-License-Identifier: BSD 2-Clause License
 #
@@ -55,15 +55,18 @@ from dotenv import load_dotenv
 from google import genai
 from loguru import logger
 
-from pipecat.audio.turn.smart_turn.base_smart_turn import SmartTurnParams
-from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import LocalSmartTurnAnalyzerV3
+from pipecat.adapters.schemas.function_schema import FunctionSchema
+from pipecat.adapters.schemas.tools_schema import ToolsSchema
 from pipecat.audio.vad.silero import SileroVADAnalyzer
-from pipecat.audio.vad.vad_analyzer import VADParams
 from pipecat.frames.frames import LLMRunFrame
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
-from pipecat.processors.aggregators.openai_llm_context import OpenAILLMContext
+from pipecat.processors.aggregators.llm_context import LLMContext
+from pipecat.processors.aggregators.llm_response_universal import (
+    LLMContextAggregatorPair,
+    LLMUserAggregatorParams,
+)
 from pipecat.runner.types import RunnerArguments
 from pipecat.runner.utils import create_transport
 from pipecat.services.cartesia.tts import CartesiaTTSService
@@ -121,11 +124,7 @@ async def query_knowledge_base(params: FunctionCallParams):
 
     # for our case, the first two messages are the instructions and the user message
     # so we remove them.
-    conversation_turns = params.context.messages[2:]
-    # convert to standard messages
-    messages = []
-    for turn in conversation_turns:
-        messages.extend(params.context.to_standard_messages(turn))
+    conversation_turns = params.context.get_messages()[2:]
 
     def _is_tool_call(turn):
         if turn.get("role", None) == "tool":
@@ -135,7 +134,7 @@ async def query_knowledge_base(params: FunctionCallParams):
         return False
 
     # filter out tool calls
-    messages = [turn for turn in messages if not _is_tool_call(turn)]
+    messages = [turn for turn in conversation_turns if not _is_tool_call(turn)]
     # use the last 3 turns as the conversation history/context
     messages = messages[-3:]
     messages_json = json.dumps(messages, ensure_ascii=False, indent=2)
@@ -159,27 +158,20 @@ async def query_knowledge_base(params: FunctionCallParams):
     await params.result_callback(response.text)
 
 
-# We store functions so objects (e.g. SileroVADAnalyzer) don't get
-# instantiated. The function will be called when the desired transport gets
-# selected.
+# We use lambdas to defer transport parameter creation until the transport
+# type is selected at runtime.
 transport_params = {
     "daily": lambda: DailyParams(
         audio_in_enabled=True,
         audio_out_enabled=True,
-        vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.2)),
-        turn_analyzer=LocalSmartTurnAnalyzerV3(params=SmartTurnParams()),
     ),
     "twilio": lambda: FastAPIWebsocketParams(
         audio_in_enabled=True,
         audio_out_enabled=True,
-        vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.2)),
-        turn_analyzer=LocalSmartTurnAnalyzerV3(params=SmartTurnParams()),
     ),
     "webrtc": lambda: TransportParams(
         audio_in_enabled=True,
         audio_out_enabled=True,
-        vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.2)),
-        turn_analyzer=LocalSmartTurnAnalyzerV3(params=SmartTurnParams()),
     ),
 }
 
@@ -199,25 +191,20 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
         api_key=os.getenv("GOOGLE_API_KEY"),
     )
     llm.register_function("query_knowledge_base", query_knowledge_base)
-    tools = [
-        {
-            "function_declarations": [
-                {
-                    "name": "query_knowledge_base",
-                    "description": "Query the knowledge base for the answer to the question.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "question": {
-                                "type": "string",
-                                "description": "The question to query the knowledge base with.",
-                            },
-                        },
-                    },
-                },
-            ],
+
+    query_function = FunctionSchema(
+        name="query_knowledge_base",
+        description="Query the knowledge base for the answer to the question.",
+        properties={
+            "question": {
+                "type": "string",
+                "description": "The question to query the knowledge base with.",
+            },
         },
-    ]
+        required=["question"],
+    )
+    tools = ToolsSchema(standard_tools=[query_function])
+
     system_prompt = """\
 You are a helpful assistant who converses with a user and answers questions.
 
@@ -230,18 +217,21 @@ Your response will be turned into speech so use only simple words and punctuatio
         {"role": "user", "content": "Greet the user."},
     ]
 
-    context = OpenAILLMContext(messages, tools)
-    context_aggregator = llm.create_context_aggregator(context)
+    context = LLMContext(messages, tools)
+    user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
+        context,
+        user_params=LLMUserAggregatorParams(vad_analyzer=SileroVADAnalyzer()),
+    )
 
     pipeline = Pipeline(
         [
             transport.input(),
             stt,
-            context_aggregator.user(),
+            user_aggregator,
             llm,
             tts,
             transport.output(),
-            context_aggregator.assistant(),
+            assistant_aggregator,
         ]
     )
     task = PipelineTask(

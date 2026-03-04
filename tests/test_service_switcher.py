@@ -1,16 +1,22 @@
 #
-# Copyright (c) 2025, Daily
+# Copyright (c) 2024-2026, Daily
 #
 # SPDX-License-Identifier: BSD 2-Clause License
 #
 
 """Unit tests for ServiceSwitcher and related components."""
 
+import asyncio
 import unittest
+from dataclasses import dataclass
 
 from pipecat.frames.frames import (
     Frame,
     ManuallySwitchServiceFrame,
+    ServiceMetadataFrame,
+    ServiceSwitcherRequestMetadataFrame,
+    StartFrame,
+    SystemFrame,
     TextFrame,
 )
 from pipecat.pipeline.pipeline import Pipeline
@@ -52,6 +58,54 @@ class MockFrameProcessor(FrameProcessor):
         self.frame_count = 0
 
 
+@dataclass
+class MockMetadataFrame(ServiceMetadataFrame):
+    """A mock metadata frame for testing ServiceMetadataFrame handling."""
+
+    pass
+
+
+class MockMetadataService(FrameProcessor):
+    """A mock service that emits ServiceMetadataFrame like STT services.
+
+    Pushes MockMetadataFrame on StartFrame and ServiceSwitcherRequestMetadataFrame.
+    """
+
+    def __init__(self, test_name: str, **kwargs):
+        super().__init__(name=test_name, **kwargs)
+        self.test_name = test_name
+        self.processed_frames = []
+        self.metadata_push_count = 0
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+        self.processed_frames.append(frame)
+
+        if isinstance(frame, StartFrame):
+            await self.push_frame(frame, direction)
+            await self._push_metadata()
+        elif isinstance(frame, ServiceSwitcherRequestMetadataFrame):
+            await self._push_metadata()
+            await self.push_frame(frame, direction)
+        else:
+            await self.push_frame(frame, direction)
+
+    async def _push_metadata(self):
+        self.metadata_push_count += 1
+        await self.push_frame(MockMetadataFrame(service_name=self.test_name))
+
+    def reset_counters(self):
+        self.processed_frames = []
+        self.metadata_push_count = 0
+
+
+@dataclass
+class DummySystemFrame(SystemFrame):
+    """A dummy system frame for testing purposes."""
+
+    text: str = ""
+
+
 class TestServiceSwitcherStrategyManual(unittest.IsolatedAsyncioTestCase):
     """Test cases for ServiceSwitcherStrategyManual."""
 
@@ -69,14 +123,7 @@ class TestServiceSwitcherStrategyManual(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(strategy.services, self.services)
         self.assertEqual(strategy.active_service, self.service1)  # First service should be active
 
-    def test_init_with_empty_services(self):
-        """Test initialization with an empty list of services."""
-        strategy = ServiceSwitcherStrategyManual([])
-
-        self.assertEqual(strategy.services, [])
-        self.assertIsNone(strategy.active_service)
-
-    def test_handle_manually_switch_service_frame(self):
+    async def test_handle_manually_switch_service_frame(self):
         """Test manual service switching with ManuallySwitchServiceFrame."""
         strategy = ServiceSwitcherStrategyManual(self.services)
 
@@ -86,7 +133,7 @@ class TestServiceSwitcherStrategyManual(unittest.IsolatedAsyncioTestCase):
 
         # Switch to service2
         switch_frame = ManuallySwitchServiceFrame(service=self.service2)
-        strategy.handle_frame(switch_frame, FrameDirection.DOWNSTREAM)
+        await strategy.handle_frame(switch_frame, FrameDirection.DOWNSTREAM)
 
         self.assertNotEqual(strategy.active_service, self.service1)
         self.assertEqual(strategy.active_service, self.service2)
@@ -94,21 +141,66 @@ class TestServiceSwitcherStrategyManual(unittest.IsolatedAsyncioTestCase):
 
         # Switch to service3
         switch_frame = ManuallySwitchServiceFrame(service=self.service3)
-        strategy.handle_frame(switch_frame, FrameDirection.DOWNSTREAM)
+        await strategy.handle_frame(switch_frame, FrameDirection.DOWNSTREAM)
 
         self.assertNotEqual(strategy.active_service, self.service1)
         self.assertNotEqual(strategy.active_service, self.service2)
         self.assertEqual(strategy.active_service, self.service3)
 
-    def test_handle_frame_unsupported_frame_type(self):
+    async def test_on_service_switched_event(self):
+        """Test that on_service_switched event fires with correct arguments."""
+        strategy = ServiceSwitcherStrategyManual(self.services)
+
+        switched_events = []
+
+        @strategy.event_handler("on_service_switched")
+        async def on_service_switched(strategy, service):
+            switched_events.append((strategy, service))
+
+        # Switch to service2
+        switch_frame = ManuallySwitchServiceFrame(service=self.service2)
+        await strategy.handle_frame(switch_frame, FrameDirection.DOWNSTREAM)
+        await asyncio.sleep(0)  # Let async event task run
+
+        self.assertEqual(len(switched_events), 1)
+        self.assertIsInstance(switched_events[0][0], ServiceSwitcherStrategyManual)
+        self.assertEqual(switched_events[0][1], self.service2)
+
+        # Switch to service3
+        switch_frame = ManuallySwitchServiceFrame(service=self.service3)
+        await strategy.handle_frame(switch_frame, FrameDirection.DOWNSTREAM)
+        await asyncio.sleep(0)
+
+        self.assertEqual(len(switched_events), 2)
+        self.assertEqual(switched_events[1][1], self.service3)
+
+    async def test_on_service_switched_event_not_fired_for_unknown_service(self):
+        """Test that on_service_switched event does not fire for services not in the list."""
+        strategy = ServiceSwitcherStrategyManual(self.services)
+
+        switched_events = []
+
+        @strategy.event_handler("on_service_switched")
+        async def on_service_switched(strategy, service):
+            switched_events.append(service)
+
+        # Try switching to a service not in the list
+        unknown_service = MockFrameProcessor("unknown")
+        switch_frame = ManuallySwitchServiceFrame(service=unknown_service)
+        await strategy.handle_frame(switch_frame, FrameDirection.DOWNSTREAM)
+        await asyncio.sleep(0)
+
+        self.assertEqual(len(switched_events), 0)
+        self.assertEqual(strategy.active_service, self.service1)  # Unchanged
+
+    async def test_handle_frame_unsupported_frame_type(self):
         """Test that unsupported frame types raise an error."""
         strategy = ServiceSwitcherStrategyManual(self.services)
         unsupported_frame = TextFrame(text="test")  # Not a ServiceSwitcherFrame
 
-        with self.assertRaises(ValueError) as context:
-            strategy.handle_frame(unsupported_frame, FrameDirection.DOWNSTREAM)
+        result = await strategy.handle_frame(unsupported_frame, FrameDirection.DOWNSTREAM)
 
-        self.assertIn("Unsupported frame type", str(context.exception))
+        self.assertIsNone(result)
 
 
 class TestServiceSwitcher(unittest.IsolatedAsyncioTestCase):
@@ -140,14 +232,22 @@ class TestServiceSwitcher(unittest.IsolatedAsyncioTestCase):
         # Send some test frames
         frames_to_send = [
             TextFrame(text="Hello 1"),
+            DummySystemFrame(text="System Message 1"),
             TextFrame(text="Hello 2"),
+            DummySystemFrame(text="System Message 2"),
             TextFrame(text="Hello 3"),
         ]
 
         await run_test(
             switcher,
             frames_to_send=frames_to_send,
-            expected_down_frames=[TextFrame, TextFrame, TextFrame],
+            expected_down_frames=[
+                DummySystemFrame,
+                DummySystemFrame,
+                TextFrame,
+                TextFrame,
+                TextFrame,
+            ],
             expected_up_frames=[],  # Expect no error frames
         )
 
@@ -156,7 +256,13 @@ class TestServiceSwitcher(unittest.IsolatedAsyncioTestCase):
         text_frames = [f for f in self.service1.processed_frames if isinstance(f, TextFrame)]
         self.assertEqual(len(text_frames), 3)
 
-        # Check that other services don't receive text frames (they might get StartFrame/EndFrame)
+        # Only service1 should have processed the system frames
+        system_frames = [
+            f for f in self.service1.processed_frames if isinstance(f, DummySystemFrame)
+        ]
+        self.assertEqual(len(system_frames), 2)
+
+        # Check that other services don't receive text frames (they still get StartFrame/EndFrame)
         service2_text_frames = [
             f for f in self.service2.processed_frames if isinstance(f, TextFrame)
         ]
@@ -166,9 +272,23 @@ class TestServiceSwitcher(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(service2_text_frames), 0)
         self.assertEqual(len(service3_text_frames), 0)
 
+        # Check that other services don't receive dummy system frames (they still get StartFrame/EndFrame)
+        service2_system_frames = [
+            f for f in self.service2.processed_frames if isinstance(f, DummySystemFrame)
+        ]
+        service3_system_frames = [
+            f for f in self.service3.processed_frames if isinstance(f, DummySystemFrame)
+        ]
+        self.assertEqual(len(service2_system_frames), 0)
+        self.assertEqual(len(service3_system_frames), 0)
+
         # Verify the actual text frames processed
         for i, frame in enumerate(text_frames):
             self.assertEqual(frame.text, f"Hello {i + 1}")
+
+        # Verify the actual system frames processed
+        for i, frame in enumerate(system_frames):
+            self.assertEqual(frame.text, f"System Message {i + 1}")
 
     async def test_service_switching(self):
         """Test that after service switching using ManuallySwitchServiceFrame, the new active service receives frames while others don't."""
@@ -186,7 +306,7 @@ class TestServiceSwitcher(unittest.IsolatedAsyncioTestCase):
                 ManuallySwitchServiceFrame(service=self.service2),
                 TextFrame("Hello 2"),
             ],
-            expected_down_frames=[TextFrame, ManuallySwitchServiceFrame, TextFrame],
+            expected_down_frames=[TextFrame, TextFrame],
             expected_up_frames=[],  # Expect no error frames
         )
 
@@ -252,9 +372,7 @@ class TestServiceSwitcher(unittest.IsolatedAsyncioTestCase):
             ],
             expected_down_frames=[
                 TextFrame,
-                ManuallySwitchServiceFrame,
                 TextFrame,
-                ManuallySwitchServiceFrame,
                 TextFrame,
             ],
             expected_up_frames=[],  # Expect no error frames
@@ -297,6 +415,86 @@ class TestServiceSwitcher(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(switcher2_service2_texts), 1)
         self.assertEqual(switcher2_service2_texts[0].text, "After switching second switcher")
+
+
+class TestServiceSwitcherMetadata(unittest.IsolatedAsyncioTestCase):
+    """Test cases for ServiceMetadataFrame handling in ServiceSwitcher."""
+
+    def setUp(self):
+        """Set up test fixtures with mock metadata services."""
+        self.service1 = MockMetadataService("service1")
+        self.service2 = MockMetadataService("service2")
+        self.services = [self.service1, self.service2]
+
+    async def test_only_active_service_metadata_at_startup(self):
+        """Test that only the active service's metadata leaves the ServiceSwitcher at startup."""
+        switcher = ServiceSwitcher(self.services, ServiceSwitcherStrategyManual)
+
+        # Run the pipeline (StartFrame triggers metadata emission)
+        output_frames = []
+
+        async def capture_frame(frame: Frame):
+            output_frames.append(frame)
+
+        await run_test(
+            switcher,
+            frames_to_send=[TextFrame(text="test")],
+            expected_down_frames=[MockMetadataFrame, TextFrame],
+            expected_up_frames=[],
+        )
+
+        # Both services push metadata internally on StartFrame, but only the
+        # active service's metadata passes through the filter
+        self.assertEqual(self.service1.metadata_push_count, 1)  # StartFrame (passes filter)
+        self.assertEqual(self.service2.metadata_push_count, 1)  # StartFrame (blocked by filter)
+
+    async def test_metadata_emitted_on_service_switch(self):
+        """Test that switching services triggers metadata emission from the new active service."""
+        switcher = ServiceSwitcher(self.services, ServiceSwitcherStrategyManual)
+
+        # Reset counters after startup
+        self.service1.reset_counters()
+        self.service2.reset_counters()
+
+        await run_test(
+            switcher,
+            frames_to_send=[
+                TextFrame(text="before switch"),
+                ManuallySwitchServiceFrame(service=self.service2),
+                TextFrame(text="after switch"),
+            ],
+            expected_down_frames=[
+                MockMetadataFrame,  # From startup (service1)
+                TextFrame,
+                MockMetadataFrame,  # From service2 after switch
+                TextFrame,
+            ],
+            expected_up_frames=[],
+        )
+
+        # service2 should have received ServiceSwitcherRequestMetadataFrame after becoming active
+        request_frames = [
+            f
+            for f in self.service2.processed_frames
+            if isinstance(f, ServiceSwitcherRequestMetadataFrame)
+        ]
+        self.assertEqual(len(request_frames), 1)
+
+    async def test_inactive_service_metadata_blocked(self):
+        """Test that metadata from inactive services is blocked."""
+        switcher = ServiceSwitcher(self.services, ServiceSwitcherStrategyManual)
+
+        # Run and collect output frames
+        await run_test(
+            switcher,
+            frames_to_send=[TextFrame(text="test")],
+            expected_down_frames=[MockMetadataFrame, TextFrame],
+            expected_up_frames=[],
+        )
+
+        # service2 pushed metadata on StartFrame, but it should have been blocked
+        self.assertGreaterEqual(self.service2.metadata_push_count, 1)
+        # Only one MockMetadataFrame should have left (from service1)
 
 
 if __name__ == "__main__":

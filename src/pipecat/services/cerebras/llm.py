@@ -1,12 +1,10 @@
 #
-# Copyright (c) 2024–2025, Daily
+# Copyright (c) 2024-2026, Daily
 #
 # SPDX-License-Identifier: BSD 2-Clause License
 #
 
 """Cerebras LLM service implementation using OpenAI-compatible interface."""
-
-from typing import List
 
 from loguru import logger
 
@@ -68,16 +66,16 @@ class CerebrasLLMService(OpenAILLMService):
             Dictionary of parameters for the chat completion request.
         """
         params = {
-            "model": self.model_name,
+            "model": self._settings.model,
             "stream": True,
-            "seed": self._settings["seed"],
-            "temperature": self._settings["temperature"],
-            "top_p": self._settings["top_p"],
-            "max_completion_tokens": self._settings["max_completion_tokens"],
+            "seed": self._settings.seed,
+            "temperature": self._settings.temperature,
+            "top_p": self._settings.top_p,
+            "max_completion_tokens": self._settings.max_completion_tokens,
         }
 
         # Messages, tools, tool_choice
         params.update(params_from_context)
 
-        params.update(self._settings["extra"])
+        params.update(self._settings.extra)
         return params

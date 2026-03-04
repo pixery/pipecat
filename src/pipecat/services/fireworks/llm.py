@@ -1,12 +1,10 @@
 #
-# Copyright (c) 2024–2025, Daily
+# Copyright (c) 2024-2026, Daily
 #
 # SPDX-License-Identifier: BSD 2-Clause License
 #
 
 """Fireworks AI service implementation using OpenAI-compatible interface."""
-
-from typing import List
 
 from loguru import logger
 
@@ -68,17 +66,17 @@ class FireworksLLMService(OpenAILLMService):
             Dictionary of parameters for the chat completion request.
         """
         params = {
-            "model": self.model_name,
+            "model": self._settings.model,
             "stream": True,
-            "frequency_penalty": self._settings["frequency_penalty"],
-            "presence_penalty": self._settings["presence_penalty"],
-            "temperature": self._settings["temperature"],
-            "top_p": self._settings["top_p"],
-            "max_tokens": self._settings["max_tokens"],
+            "frequency_penalty": self._settings.frequency_penalty,
+            "presence_penalty": self._settings.presence_penalty,
+            "temperature": self._settings.temperature,
+            "top_p": self._settings.top_p,
+            "max_tokens": self._settings.max_tokens,
         }
 
         # Messages, tools, tool_choice
         params.update(params_from_context)
 
-        params.update(self._settings["extra"])
+        params.update(self._settings.extra)
         return params

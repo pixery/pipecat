@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2024–2025, Daily
+# Copyright (c) 2024-2026, Daily
 #
 # SPDX-License-Identifier: BSD 2-Clause License
 #
@@ -12,14 +12,24 @@ using REST endpoints for creating images from text prompts.
 
 import asyncio
 import io
+from dataclasses import dataclass
 from typing import AsyncGenerator
 
 import aiohttp
-from loguru import logger
 from PIL import Image
 
 from pipecat.frames.frames import ErrorFrame, Frame, URLImageRawFrame
 from pipecat.services.image_service import ImageGenService
+from pipecat.services.settings import ImageGenSettings
+
+
+@dataclass
+class AzureImageGenSettings(ImageGenSettings):
+    """Settings for the Azure image generation service.
+
+    Parameters:
+        model: Azure image generation model identifier.
+    """
 
 
 class AzureImageGenServiceREST(ImageGenService):
@@ -50,12 +60,11 @@ class AzureImageGenServiceREST(ImageGenService):
             aiohttp_session: Shared aiohttp session for HTTP requests.
             api_version: Azure API version string. Defaults to "2023-06-01-preview".
         """
-        super().__init__()
+        super().__init__(settings=AzureImageGenSettings(model=model))
 
         self._api_key = api_key
         self._azure_endpoint = endpoint
         self._api_version = api_version
-        self.set_model_name(model)
         self._image_size = image_size
         self._aiohttp_session = aiohttp_session
 
@@ -91,7 +100,6 @@ class AzureImageGenServiceREST(ImageGenService):
             while status != "succeeded":
                 attempts_left -= 1
                 if attempts_left == 0:
-                    logger.error(f"{self} error: image generation timed out")
                     yield ErrorFrame("Image generation timed out")
                     return
 
@@ -104,7 +112,6 @@ class AzureImageGenServiceREST(ImageGenService):
 
             image_url = json_response["result"]["data"][0]["url"] if json_response else None
             if not image_url:
-                logger.error(f"{self} error: image generation failed")
                 yield ErrorFrame("Image generation failed")
                 return
 

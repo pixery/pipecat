@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2024–2025, Daily
+# Copyright (c) 2024-2026, Daily
 #
 # SPDX-License-Identifier: BSD 2-Clause License
 #
@@ -9,14 +9,11 @@ import os
 from dotenv import load_dotenv
 from loguru import logger
 
-from pipecat.frames.frames import EndFrame
+from pipecat.frames.frames import EndFrame, LLMContextFrame
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineTask
-from pipecat.processors.aggregators.openai_llm_context import (
-    OpenAILLMContext,
-    OpenAILLMContextFrame,
-)
+from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.runner.types import RunnerArguments
 from pipecat.runner.utils import create_transport
 from pipecat.services.cartesia.tts import CartesiaTTSService
@@ -28,9 +25,8 @@ from pipecat.transports.websocket.fastapi import FastAPIWebsocketParams
 load_dotenv(override=True)
 
 
-# We store functions so objects (e.g. SileroVADAnalyzer) don't get
-# instantiated. The function will be called when the desired transport gets
-# selected.
+# We use lambdas to defer transport parameter creation until the transport
+# type is selected at runtime.
 transport_params = {
     "daily": lambda: DailyParams(audio_out_enabled=True),
     "twilio": lambda: FastAPIWebsocketParams(audio_out_enabled=True),
@@ -63,7 +59,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     # Register an event handler so we can play the audio when the client joins
     @transport.event_handler("on_client_connected")
     async def on_client_connected(transport, client):
-        await task.queue_frames([OpenAILLMContextFrame(OpenAILLMContext(messages)), EndFrame()])
+        await task.queue_frames([LLMContextFrame(LLMContext(messages)), EndFrame()])
 
     runner = PipelineRunner(handle_sigint=runner_args.handle_sigint)
 

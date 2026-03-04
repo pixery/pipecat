@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2024–2025, Daily
+# Copyright (c) 2024-2026, Daily
 #
 # SPDX-License-Identifier: BSD 2-Clause License
 #
@@ -10,7 +10,8 @@ This module provides integration with Coqui XTTS streaming server for
 text-to-speech synthesis using local Docker deployment.
 """
 
-from typing import Any, AsyncGenerator, Dict, Optional
+from dataclasses import dataclass, field
+from typing import AsyncGenerator, Dict, Optional
 
 import aiohttp
 from loguru import logger
@@ -24,8 +25,9 @@ from pipecat.frames.frames import (
     TTSStartedFrame,
     TTSStoppedFrame,
 )
+from pipecat.services.settings import NOT_GIVEN, TTSSettings, _NotGiven
 from pipecat.services.tts_service import TTSService
-from pipecat.transcriptions.language import Language
+from pipecat.transcriptions.language import Language, resolve_language
 from pipecat.utils.tracing.service_decorators import traced_tts
 
 # The server below can connect to XTTS through a local running docker
@@ -45,7 +47,7 @@ def language_to_xtts_language(language: Language) -> Optional[str]:
     Returns:
         The corresponding XTTS language code, or None if not supported.
     """
-    BASE_LANGUAGES = {
+    LANGUAGE_MAP = {
         Language.CS: "cs",
         Language.DE: "de",
         Language.EN: "en",
@@ -65,22 +67,18 @@ def language_to_xtts_language(language: Language) -> Optional[str]:
         Language.ZH: "zh-cn",
     }
 
-    result = BASE_LANGUAGES.get(language)
+    return resolve_language(language, LANGUAGE_MAP, use_base_code=True)
 
-    # If not found in base languages, try to find the base language from a variant
-    if not result:
-        # Convert enum value to string and get the base language part (e.g. es-ES -> es)
-        lang_str = str(language.value)
-        base_code = lang_str.split("-")[0].lower()
 
-        # Special handling for Chinese variants
-        if base_code == "zh":
-            result = "zh-cn"
-        else:
-            # Look up the base code in our supported languages
-            result = base_code if base_code in BASE_LANGUAGES.values() else None
+@dataclass
+class XTTSTTSSettings(TTSSettings):
+    """Settings for XTTS TTS service.
 
-    return result
+    Parameters:
+        base_url: Base URL of the XTTS streaming server.
+    """
+
+    base_url: str | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
 
 
 class XTTSService(TTSService):
@@ -90,6 +88,8 @@ class XTTSService(TTSService):
     streaming server. Supports multiple languages and voice cloning through
     studio speakers configuration.
     """
+
+    _settings: XTTSTTSSettings
 
     def __init__(
         self,
@@ -111,13 +111,16 @@ class XTTSService(TTSService):
             sample_rate: Audio sample rate. If None, uses default.
             **kwargs: Additional arguments passed to parent TTSService.
         """
-        super().__init__(sample_rate=sample_rate, **kwargs)
-
-        self._settings = {
-            "language": self.language_to_service_language(language),
-            "base_url": base_url,
-        }
-        self.set_voice(voice_id)
+        super().__init__(
+            sample_rate=sample_rate,
+            settings=XTTSTTSSettings(
+                model=None,
+                voice=voice_id,
+                language=self.language_to_service_language(language),
+                base_url=base_url,
+            ),
+            **kwargs,
+        )
         self._studio_speakers: Optional[Dict[str, Any]] = None
         self._aiohttp_session = aiohttp_session
 
@@ -153,26 +156,22 @@ class XTTSService(TTSService):
         if self._studio_speakers:
             return
 
-        async with self._aiohttp_session.get(self._settings["base_url"] + "/studio_speakers") as r:
+        async with self._aiohttp_session.get(self._settings.base_url + "/studio_speakers") as r:
             if r.status != 200:
                 text = await r.text()
-                logger.error(
-                    f"{self} error getting studio speakers (status: {r.status}, error: {text})"
-                )
                 await self.push_error(
-                    ErrorFrame(
-                        f"Error error getting studio speakers (status: {r.status}, error: {text})"
-                    )
+                    error_msg=f"Error getting studio speakers (status: {r.status}, error: {text})"
                 )
                 return
             self._studio_speakers = await r.json()
 
     @traced_tts
-    async def run_tts(self, text: str) -> AsyncGenerator[Frame, None]:
+    async def run_tts(self, text: str, context_id: str) -> AsyncGenerator[Frame, None]:
         """Generate speech from text using XTTS streaming server.
 
         Args:
             text: The text to synthesize into speech.
+            context_id: The context ID for tracking audio frames.
 
         Yields:
             Frame: Audio frames containing the synthesized speech.
@@ -183,13 +182,13 @@ class XTTSService(TTSService):
             logger.error(f"{self} no studio speakers available")
             return
 
-        embeddings = self._studio_speakers[self._voice_id]
+        embeddings = self._studio_speakers[self._settings.voice]
 
-        url = self._settings["base_url"] + "/tts_stream"
+        url = self._settings.base_url + "/tts_stream"
 
         payload = {
             "text": text.replace(".", "").replace("*", ""),
-            "language": self._settings["language"],
+            "language": self._settings.language,
             "speaker_embedding": embeddings["speaker_embedding"],
             "gpt_cond_latent": embeddings["gpt_cond_latent"],
             "add_wav_header": False,
@@ -201,13 +200,12 @@ class XTTSService(TTSService):
         async with self._aiohttp_session.post(url, json=payload) as r:
             if r.status != 200:
                 text = await r.text()
-                logger.error(f"{self} error getting audio (status: {r.status}, error: {text})")
-                yield ErrorFrame(f"Error getting audio (status: {r.status}, error: {text})")
+                yield ErrorFrame(error=f"Error getting audio (status: {r.status}, error: {text})")
                 return
 
             await self.start_tts_usage_metrics(text)
 
-            yield TTSStartedFrame()
+            yield TTSStartedFrame(context_id=context_id)
 
             CHUNK_SIZE = self.chunk_size
 
@@ -232,7 +230,9 @@ class XTTSService(TTSService):
                             bytes(process_data), 24000, self.sample_rate
                         )
                         # Create the frame with the resampled audio
-                        frame = TTSAudioRawFrame(resampled_audio, self.sample_rate, 1)
+                        frame = TTSAudioRawFrame(
+                            resampled_audio, self.sample_rate, 1, context_id=context_id
+                        )
                         yield frame
 
             # Process any remaining data in the buffer.
@@ -240,7 +240,9 @@ class XTTSService(TTSService):
                 resampled_audio = await self._resampler.resample(
                     bytes(buffer), 24000, self.sample_rate
                 )
-                frame = TTSAudioRawFrame(resampled_audio, self.sample_rate, 1)
+                frame = TTSAudioRawFrame(
+                    resampled_audio, self.sample_rate, 1, context_id=context_id
+                )
                 yield frame
 
-            yield TTSStoppedFrame()
+            yield TTSStoppedFrame(context_id=context_id)

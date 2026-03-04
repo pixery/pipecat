@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2024–2025, Daily
+# Copyright (c) 2024-2026, Daily
 #
 # SPDX-License-Identifier: BSD 2-Clause License
 #
@@ -16,14 +16,17 @@ import os
 # Suppress gRPC fork warnings
 os.environ["GRPC_ENABLE_FORK_SUPPORT"] = "false"
 
-from typing import AsyncGenerator, Optional
+from dataclasses import dataclass
+from typing import Any, AsyncGenerator, Optional
 
 from loguru import logger
 from PIL import Image
 from pydantic import BaseModel, Field
 
 from pipecat.frames.frames import ErrorFrame, Frame, URLImageRawFrame
+from pipecat.services.google.utils import update_google_client_http_options
 from pipecat.services.image_service import ImageGenService
+from pipecat.services.settings import ImageGenSettings
 
 try:
     from google import genai
@@ -32,6 +35,15 @@ except ModuleNotFoundError as e:
     logger.error(f"Exception: {e}")
     logger.error("In order to use Google AI, you need to `pip install pipecat-ai[google]`.")
     raise Exception(f"Missing module: {e}")
+
+
+@dataclass
+class GoogleImageGenSettings(ImageGenSettings):
+    """Settings for the Google image generation service.
+
+    Parameters:
+        model: Google Imagen model identifier.
+    """
 
 
 class GoogleImageGenService(ImageGenService):
@@ -60,6 +72,7 @@ class GoogleImageGenService(ImageGenService):
         *,
         api_key: str,
         params: Optional[InputParams] = None,
+        http_options: Optional[Any] = None,
         **kwargs,
     ):
         """Initialize the GoogleImageGenService with API key and parameters.
@@ -67,12 +80,17 @@ class GoogleImageGenService(ImageGenService):
         Args:
             api_key: Google AI API key for authentication.
             params: Configuration parameters for image generation. Defaults to InputParams().
+            http_options: HTTP options for the client.
             **kwargs: Additional arguments passed to the parent ImageGenService.
         """
-        super().__init__(**kwargs)
-        self._params = params or GoogleImageGenService.InputParams()
-        self._client = genai.Client(api_key=api_key)
-        self.set_model_name(self._params.model)
+        params = params or GoogleImageGenService.InputParams()
+        super().__init__(settings=GoogleImageGenSettings(model=params.model), **kwargs)
+        self._params = params
+
+        # Add client header
+        http_options = update_google_client_http_options(http_options)
+
+        self._client = genai.Client(api_key=api_key, http_options=http_options)
 
     def can_generate_metrics(self) -> bool:
         """Check if this service can generate processing metrics.
@@ -110,7 +128,6 @@ class GoogleImageGenService(ImageGenService):
             await self.stop_ttfb_metrics()
 
             if not response or not response.generated_images:
-                logger.error(f"{self} error: image generation failed")
                 yield ErrorFrame("Image generation failed")
                 return
 
@@ -128,5 +145,4 @@ class GoogleImageGenService(ImageGenService):
                 yield frame
 
         except Exception as e:
-            logger.error(f"{self} error generating image: {e}")
             yield ErrorFrame(f"Image generation error: {str(e)}")

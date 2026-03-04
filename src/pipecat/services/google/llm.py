@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2024–2025, Daily
+# Copyright (c) 2024-2026, Daily
 #
 # SPDX-License-Identifier: BSD 2-Clause License
 #
@@ -15,8 +15,8 @@ import io
 import json
 import os
 import uuid
-from dataclasses import dataclass
-from typing import Any, AsyncIterator, Dict, List, Optional
+from dataclasses import dataclass, field
+from typing import Any, AsyncIterator, ClassVar, Dict, List, Literal, Optional
 
 from loguru import logger
 from PIL import Image
@@ -24,6 +24,7 @@ from pydantic import BaseModel, Field
 
 from pipecat.adapters.services.gemini_adapter import GeminiLLMAdapter, GeminiLLMInvocationParams
 from pipecat.frames.frames import (
+    AssistantImageRawFrame,
     AudioRawFrame,
     Frame,
     FunctionCallCancelFrame,
@@ -32,10 +33,12 @@ from pipecat.frames.frames import (
     LLMContextFrame,
     LLMFullResponseEndFrame,
     LLMFullResponseStartFrame,
+    LLMMessagesAppendFrame,
     LLMMessagesFrame,
     LLMTextFrame,
-    LLMUpdateSettingsFrame,
-    UserImageRawFrame,
+    LLMThoughtEndFrame,
+    LLMThoughtStartFrame,
+    LLMThoughtTextFrame,
 )
 from pipecat.metrics.metrics import LLMTokenUsage
 from pipecat.processors.aggregators.llm_context import LLMContext
@@ -49,11 +52,13 @@ from pipecat.processors.aggregators.openai_llm_context import (
 )
 from pipecat.processors.frame_processor import FrameDirection
 from pipecat.services.google.frames import LLMSearchResponseFrame
+from pipecat.services.google.utils import update_google_client_http_options
 from pipecat.services.llm_service import FunctionCallFromLLM, LLMService
 from pipecat.services.openai.llm import (
     OpenAIAssistantContextAggregator,
     OpenAIUserContextAggregator,
 )
+from pipecat.services.settings import NOT_GIVEN, LLMSettings, _NotGiven, is_given
 from pipecat.utils.tracing.service_decorators import traced_llm
 
 # Suppress gRPC fork warnings
@@ -75,6 +80,9 @@ try:
         HarmCategory,
         HarmBlockThreshold,
     )
+
+    # Temporary hack to be able to process Nano Banana returned images.
+    genai._api_client.READ_BUFFER_SIZE = 5 * 1024 * 1024
 except ModuleNotFoundError as e:
     logger.error(f"Exception: {e}")
     logger.error("In order to use Google AI, you need to `pip install pipecat-ai[google]`.")
@@ -86,7 +94,14 @@ class GoogleUserContextAggregator(OpenAIUserContextAggregator):
 
     Extends OpenAI user context aggregator to handle Google AI's specific
     Content and Part message format for user messages.
+
+    .. deprecated:: 0.0.99
+        `OpenAIUserContextAggregator` is deprecated and will be removed in a future version.
+        Use the universal `LLMContext` and `LLMContextAggregatorPair` instead.
+        See `OpenAILLMContext` docstring for migration guide.
     """
+
+    # Super handles deprecation warning
 
     async def handle_aggregation(self, aggregation: str):
         """Add the aggregated user text to the context as a Google Content message.
@@ -102,7 +117,14 @@ class GoogleAssistantContextAggregator(OpenAIAssistantContextAggregator):
 
     Extends OpenAI assistant context aggregator to handle Google AI's specific
     Content and Part message format for assistant responses and function calls.
+
+    .. deprecated:: 0.0.99
+        `GoogleAssistantContextAggregator` is deprecated and will be removed in a future version.
+        Use the universal `LLMContext` and `LLMContextAggregatorPair` instead.
+        See `OpenAILLMContext` docstring for migration guide.
     """
+
+    # Super handles deprecation warning
 
     async def handle_aggregation(self, aggregation: str):
         """Handle aggregated assistant text response.
@@ -179,32 +201,22 @@ class GoogleAssistantContextAggregator(OpenAIAssistantContextAggregator):
                     if part.function_response and part.function_response.id == tool_call_id:
                         part.function_response.response = {"value": json.dumps(result)}
 
-    async def handle_user_image_frame(self, frame: UserImageRawFrame):
-        """Handle user image frame.
-
-        Args:
-            frame: Frame containing user image data and request context.
-        """
-        await self._update_function_call_result(
-            frame.request.function_name, frame.request.tool_call_id, "COMPLETED"
-        )
-        self._context.add_image_frame_message(
-            format=frame.format,
-            size=frame.size,
-            image=frame.image,
-            text=frame.request.context,
-        )
-
 
 @dataclass
 class GoogleContextAggregatorPair:
     """Pair of Google context aggregators for user and assistant messages.
+
+    .. deprecated:: 0.0.99
+        `GoogleContextAggregatorPair` is deprecated and will be removed in a future version.
+        Use the universal `LLMContext` and `LLMContextAggregatorPair` instead.
+        See `OpenAILLMContext` docstring for migration guide.
 
     Parameters:
         _user: User context aggregator for handling user messages.
         _assistant: Assistant context aggregator for handling assistant responses.
     """
 
+    # Aggregators handle deprecation warnings
     _user: GoogleUserContextAggregator
     _assistant: GoogleAssistantContextAggregator
 
@@ -230,6 +242,11 @@ class GoogleLLMContext(OpenAILLMContext):
 
     This class handles conversion between OpenAI-style messages and Google AI's
     Content/Part format, including system messages, function calls, and media.
+
+    .. deprecated:: 0.0.99
+        `GoogleLLMContext` is deprecated and will be removed in a future version.
+        Use the universal `LLMContext` and `LLMContextAggregatorPair` instead.
+        See `OpenAILLMContext` docstring for migration guide.
     """
 
     def __init__(
@@ -245,6 +262,7 @@ class GoogleLLMContext(OpenAILLMContext):
             tools: Available tools/functions for the model.
             tool_choice: Tool choice configuration.
         """
+        # Super handles deprecation warning
         super().__init__(messages=messages, tools=tools, tool_choice=tool_choice)
         self.system_message = None
 
@@ -472,11 +490,16 @@ class GoogleLLMContext(OpenAILLMContext):
                 if c["type"] == "text":
                     parts.append(Part(text=c["text"]))
                 elif c["type"] == "image_url":
+                    # Extract MIME type from data URL (format: "data:image/jpeg;base64,...")
+                    url = c["image_url"]["url"]
+                    mime_type = (
+                        url.split(":")[1].split(";")[0] if url.startswith("data:") else "image/jpeg"
+                    )
                     parts.append(
                         Part(
                             inline_data=Blob(
-                                mime_type="image/jpeg",
-                                data=base64.b64decode(c["image_url"]["url"].split(",")[1]),
+                                mime_type=mime_type,
+                                data=base64.b64decode(url.split(",")[1]),
                             )
                         )
                     )
@@ -653,6 +676,62 @@ class GoogleLLMContext(OpenAILLMContext):
         self._messages = [m for m in self._messages if m.parts]
 
 
+class GoogleThinkingConfig(BaseModel):
+    """Configuration for controlling the model's internal "thinking" process used before generating a response.
+
+    Gemini 2.5 and 3 series models have this thinking process.
+
+    Parameters:
+        thinking_level: Thinking level for Gemini 3 models.
+            For Gemini 3 Pro, this can be "low" or "high".
+            For Gemini 3 Flash, this can be "minimal", "low", "medium", or "high".
+            If not provided, Gemini 3 models default to "high".
+            Note: Gemini 2.5 series must use thinking_budget instead.
+        thinking_budget: Token budget for thinking, for Gemini 2.5 series.
+            -1 for dynamic thinking (model decides), 0 to disable thinking,
+            or a specific token count (e.g., 128-32768 for 2.5 Pro).
+            If not provided, most models today default to dynamic thinking.
+            See https://ai.google.dev/gemini-api/docs/thinking#set-budget
+            for default values and allowed ranges.
+            Note: Gemini 3 models must use thinking_level instead.
+        include_thoughts: Whether to include thought summaries in the response.
+            Today's models default to not including thoughts (False).
+    """
+
+    thinking_budget: Optional[int] = Field(default=None)
+
+    # Why `| str` here? To not break compatibility in case Google adds more
+    # levels in the future.
+    thinking_level: Optional[Literal["low", "high", "medium", "minimal"] | str] = Field(
+        default=None
+    )
+
+    include_thoughts: Optional[bool] = Field(default=None)
+
+
+@dataclass
+class GoogleLLMSettings(LLMSettings):
+    """Settings for Google LLM services.
+
+    Parameters:
+        thinking: Thinking configuration.
+    """
+
+    thinking: GoogleThinkingConfig | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
+
+    @classmethod
+    def from_mapping(cls, settings):
+        """Convert a plain dict to settings, coercing thinking dicts.
+
+        For backward compatibility, a ``thinking`` value that is a plain dict
+        is converted to a :class:`GoogleThinkingConfig`.
+        """
+        instance = super().from_mapping(settings)
+        if is_given(instance.thinking) and isinstance(instance.thinking, dict):
+            instance.thinking = GoogleThinkingConfig(**instance.thinking)
+        return instance
+
+
 class GoogleLLMService(LLMService):
     """Google AI (Gemini) LLM service implementation.
 
@@ -661,8 +740,13 @@ class GoogleLLMService(LLMService):
     expected by the Google AI model.
     """
 
+    _settings: GoogleLLMSettings
+
     # Overriding the default adapter to use the Gemini one.
     adapter_class = GeminiLLMAdapter
+
+    # Backward compatibility: ThinkingConfig used to be defined inline here.
+    ThinkingConfig = GoogleThinkingConfig
 
     class InputParams(BaseModel):
         """Input parameters for Google AI models.
@@ -672,6 +756,12 @@ class GoogleLLMService(LLMService):
             temperature: Sampling temperature between 0.0 and 2.0.
             top_k: Top-k sampling parameter.
             top_p: Top-p sampling parameter between 0.0 and 1.0.
+            thinking: Thinking configuration with thinking_budget, thinking_level, and include_thoughts.
+                Used to control the model's internal "thinking" process used before generating a response.
+                Gemini 2.5 series models use thinking_budget; Gemini 3 models use thinking_level.
+                If this is not provided, Pipecat disables thinking for all
+                models where that's possible (the 2.5 series, except 2.5 Pro),
+                to reduce latency.
             extra: Additional parameters as a dictionary.
         """
 
@@ -679,19 +769,20 @@ class GoogleLLMService(LLMService):
         temperature: Optional[float] = Field(default=None, ge=0.0, le=2.0)
         top_k: Optional[int] = Field(default=None, ge=0)
         top_p: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+        thinking: Optional[GoogleThinkingConfig] = Field(default=None)
         extra: Optional[Dict[str, Any]] = Field(default_factory=dict)
 
     def __init__(
-            self,
-            *,
-            api_key: str,
-            model: str = "gemini-2.0-flash",
-            params: Optional[InputParams] = None,
-            system_instruction: Optional[str] = None,
-            tools: Optional[List[Dict[str, Any]]] = None,
-            tool_config: Optional[Dict[str, Any]] = None,
-            http_options: Optional[HttpOptions] = None,
-            **kwargs,
+        self,
+        *,
+        api_key: str,
+        model: str = "gemini-2.5-flash",
+        params: Optional[InputParams] = None,
+        system_instruction: Optional[str] = None,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        tool_config: Optional[Dict[str, Any]] = None,
+        http_options: Optional[HttpOptions] = None,
+        **kwargs,
     ):
         """Initialize the Google LLM service.
 
@@ -705,22 +796,29 @@ class GoogleLLMService(LLMService):
             http_options: HTTP options for the client.
             **kwargs: Additional arguments passed to parent class.
         """
-        super().__init__(**kwargs)
-
         params = params or GoogleLLMService.InputParams()
 
-        self.set_model_name(model)
+        super().__init__(
+            settings=GoogleLLMSettings(
+                model=model,
+                max_tokens=params.max_tokens,
+                temperature=params.temperature,
+                top_k=params.top_k,
+                top_p=params.top_p,
+                frequency_penalty=None,
+                presence_penalty=None,
+                seed=None,
+                filter_incomplete_user_turns=False,
+                user_turn_completion_config=None,
+                thinking=params.thinking,
+                extra=params.extra if isinstance(params.extra, dict) else {},
+            ),
+            **kwargs,
+        )
+
         self._api_key = api_key
         self._system_instruction = system_instruction
-        self._http_options = http_options
-        self._create_client(api_key, http_options)
-        self._settings = {
-            "max_tokens": params.max_tokens,
-            "temperature": params.temperature,
-            "top_k": params.top_k,
-            "top_p": params.top_p,
-            "extra": params.extra if isinstance(params.extra, dict) else {},
-        }
+        self._http_options = update_google_client_http_options(http_options)
         self._safety_settings = [
             SafetySetting(category=HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold=HarmBlockThreshold.BLOCK_NONE),
             SafetySetting(category=HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold=HarmBlockThreshold.BLOCK_NONE),
@@ -731,6 +829,9 @@ class GoogleLLMService(LLMService):
         self._tools = tools
         self._tool_config = tool_config
 
+        # Initialize the API client. Subclasses can override this if needed.
+        self.create_client()
+
     def can_generate_metrics(self) -> bool:
         """Check if the service can generate usage metrics.
 
@@ -739,35 +840,52 @@ class GoogleLLMService(LLMService):
         """
         return True
 
-    def _create_client(self, api_key: str, http_options: Optional[HttpOptions] = None):
-        self._client = genai.Client(api_key=api_key, http_options=http_options)
+    def create_client(self):
+        """Create the Gemini client instance. Subclasses can override this."""
+        self._client = genai.Client(api_key=self._api_key, http_options=self._http_options)
 
-    async def run_inference(self, context: LLMContext | OpenAILLMContext) -> Optional[str]:
+    async def run_inference(
+        self, context: LLMContext | OpenAILLMContext, max_tokens: Optional[int] = None
+    ) -> Optional[str]:
         """Run a one-shot, out-of-band (i.e. out-of-pipeline) inference with the given LLM context.
 
         Args:
             context: The LLM context containing conversation history.
+            max_tokens: Optional maximum number of tokens to generate. If provided,
+                overrides the service's default max_tokens setting.
 
         Returns:
             The LLM's response as a string, or None if no response is generated.
         """
         messages = []
         system = []
+        tools = []
         if isinstance(context, LLMContext):
             adapter = self.get_llm_adapter()
             params: GeminiLLMInvocationParams = adapter.get_llm_invocation_params(context)
             messages = params["messages"]
             system = params["system_instruction"]
+            tools = params["tools"]
         else:
             context = GoogleLLMContext.upgrade_to_google(context)
             messages = context.messages
             system = getattr(context, "system_message", None)
+            tools = context.tools or []
 
-        generation_config = GenerateContentConfig(system_instruction=system, safety_settings=self._safety_settings)
+        # Build generation config using the same method as streaming
+        generation_params = self._build_generation_params(
+            system_instruction=system, tools=tools if tools else None
+        )
+
+        # Override max_output_tokens if provided
+        if max_tokens is not None:
+            generation_params["max_output_tokens"] = max_tokens
+
+        generation_config = GenerateContentConfig(**generation_params)
 
         # Use the new google-genai client's async method
         response = await self._client.aio.models.generate_content(
-            model=self._model_name,
+            model=self._settings.model,
             contents=messages,
             config=generation_config,
         )
@@ -780,30 +898,65 @@ class GoogleLLMService(LLMService):
 
         return None
 
-    def needs_mcp_alternate_schema(self) -> bool:
-        """Check if this LLM service requires alternate MCP schema.
+    def _build_generation_params(
+        self,
+        system_instruction: Optional[str] = None,
+        tools: Optional[List] = None,
+        tool_config: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Build generation parameters for Google AI API.
 
-        Google/Gemini has stricter JSON schema validation and requires
-        certain properties to be removed or modified for compatibility.
+        Args:
+            system_instruction: Optional system instruction to use.
+            tools: Optional list of tools to include.
+            tool_config: Optional tool configuration.
 
         Returns:
-            True for Google/Gemini services.
+            Dictionary of generation parameters with None values filtered out.
         """
-        return True
+        # Filter out None values and create GenerationContentConfig
+        generation_params = {
+            k: v
+            for k, v in {
+                "system_instruction": system_instruction,
+                "temperature": self._settings.temperature,
+                "top_p": self._settings.top_p,
+                "top_k": self._settings.top_k,
+                "max_output_tokens": self._settings.max_tokens,
+                "tools": tools,
+                "tool_config": tool_config,
+                "safety_settings": self._safety_settings,
+            }.items()
+            if v is not None
+        }
+
+        # Add thinking parameters if configured
+        if self._settings.thinking:
+            generation_params["thinking_config"] = self._settings.thinking.model_dump(
+                exclude_unset=True
+            )
+
+        if self._settings.extra:
+            generation_params.update(self._settings.extra)
+
+        return generation_params
 
     def _maybe_unset_thinking_budget(self, generation_params: Dict[str, Any]):
         try:
             # There's no way to introspect on model capabilities, so
             # to check for models that we know default to thinkin on
             # and can be configured to turn it off.
-            if not self._model_name.startswith("gemini-2.5-flash"):
+            if not self._settings.model.startswith("gemini-2.5-flash"):
+                return
+            # If we have an image model, we don't use a budget either.
+            if "image" in self._settings.model:
                 return
             # If thinking_config is already set, don't override it.
             if "thinking_config" in generation_params:
                 return
             generation_params.setdefault("thinking_config", {})["thinking_budget"] = 0
         except Exception as e:
-            logger.exception(f"Failed to unset thinking budget: {e}")
+            logger.error(f"Failed to unset thinking budget: {e}")
 
     async def _stream_content(
             self, params_from_context: GeminiLLMInvocationParams
@@ -825,35 +978,19 @@ class GoogleLLMService(LLMService):
         if self._tool_config:
             tool_config = self._tool_config
 
-        # Filter out None values and create GenerationContentConfig
-        generation_params = {
-            k: v
-            for k, v in {
-                "system_instruction": self._system_instruction,
-                "temperature": self._settings["temperature"],
-                "top_p": self._settings["top_p"],
-                "top_k": self._settings["top_k"],
-                "max_output_tokens": self._settings["max_tokens"],
-                "tools": tools,
-                "tool_config": tool_config,
-                "safety_settings": self._safety_settings,
-            }.items()
-            if v is not None
-        }
-
-        if self._settings["extra"]:
-            generation_params.update(self._settings["extra"])
+        # Build generation parameters
+        generation_params = self._build_generation_params(
+            system_instruction=self._system_instruction, tools=tools, tool_config=tool_config
+        )
 
         # possibly modify generation_params (in place) to set thinking to off by default
         self._maybe_unset_thinking_budget(generation_params)
 
-        generation_config = (
-            GenerateContentConfig(**generation_params) if generation_params else None
-        )
+        generation_config = GenerateContentConfig(**generation_params)
 
         await self.start_ttfb_metrics()
         return await self._client.aio.models.generate_content_stream(
-            model=self._model_name,
+            model=self._settings.model,
             contents=messages,
             config=generation_config,
         )
@@ -896,7 +1033,7 @@ class GoogleLLMService(LLMService):
         reasoning_tokens = 0
 
         grounding_metadata = None
-        search_result = ""
+        accumulated_text = ""
 
         try:
             # Generate content using either OpenAILLMContext or universal LLMContext
@@ -910,12 +1047,18 @@ class GoogleLLMService(LLMService):
             async for chunk in response:
                 # Stop TTFB metrics after the first chunk
                 await self.stop_ttfb_metrics()
+                # Gemini may send usage_metadata in multiple chunks with varying behavior:
+                # - Sometimes a single chunk, sometimes multiple chunks
+                # - Token counts may be cumulative (growing) or may change between chunks
+                # - Early chunks may include estimates/overhead that gets refined
+                # We use assignment (not accumulation) because the final chunk always contains
+                # the authoritative, billable token usage for the entire response.
                 if chunk.usage_metadata:
-                    prompt_tokens += chunk.usage_metadata.prompt_token_count or 0
-                    completion_tokens += chunk.usage_metadata.candidates_token_count or 0
-                    total_tokens += chunk.usage_metadata.total_token_count or 0
-                    cache_read_input_tokens += chunk.usage_metadata.cached_content_token_count or 0
-                    reasoning_tokens += chunk.usage_metadata.thoughts_token_count or 0
+                    prompt_tokens = chunk.usage_metadata.prompt_token_count or 0
+                    completion_tokens = chunk.usage_metadata.candidates_token_count or 0
+                    total_tokens = chunk.usage_metadata.total_token_count or 0
+                    cache_read_input_tokens = chunk.usage_metadata.cached_content_token_count or 0
+                    reasoning_tokens = chunk.usage_metadata.thoughts_token_count or 0
 
                 if not chunk.candidates:
                     continue
@@ -923,21 +1066,91 @@ class GoogleLLMService(LLMService):
                 for candidate in chunk.candidates:
                     if candidate.content and candidate.content.parts:
                         for part in candidate.content.parts:
-                            if not part.thought and part.text:
-                                search_result += part.text
-                                await self.push_frame(LLMTextFrame(part.text))
+                            function_call_id = None
+                            if part.text:
+                                if part.thought:
+                                    # Gemini emits fully-formed thoughts rather
+                                    # than chunks so bracket each thought in
+                                    # start/end
+                                    await self.push_frame(LLMThoughtStartFrame())
+                                    await self.push_frame(LLMThoughtTextFrame(part.text))
+                                    await self.push_frame(LLMThoughtEndFrame())
+                                else:
+                                    accumulated_text += part.text
+                                    await self._push_llm_text(part.text)
                             elif part.function_call:
                                 function_call = part.function_call
-                                id = function_call.id or str(uuid.uuid4())
-                                logger.debug(f"Function call: {function_call.name}:{id}")
+                                function_call_id = function_call.id or str(uuid.uuid4())
+                                logger.debug(
+                                    f"Function call: {function_call.name}:{function_call_id}"
+                                )
                                 function_calls.append(
                                     FunctionCallFromLLM(
                                         context=context,
-                                        tool_call_id=id,
+                                        tool_call_id=function_call_id,
                                         function_name=function_call.name,
                                         arguments=function_call.args or {},
                                     )
                                 )
+                            elif part.inline_data and part.inline_data.data:
+                                # Here we assume that inline_data is an image.
+                                image = Image.open(io.BytesIO(part.inline_data.data))
+                                await self.push_frame(
+                                    AssistantImageRawFrame(
+                                        image=image.tobytes(),
+                                        size=image.size,
+                                        format="RGB",
+                                        original_data=part.inline_data.data,
+                                        original_mime_type=part.inline_data.mime_type,
+                                    )
+                                )
+
+                            # Handle Gemini thought signatures.
+                            #
+                            # - Gemini 2.5: they appear on function_call Parts,
+                            # and then (surprisingly) on the last(*) Part of
+                            # model responses following the first function_call
+                            # in a conversation.
+                            # - Gemini 3 Pro: they appear on the last(*) Part
+                            # of model responses, regardless of Part type.
+                            #
+                            # (*) Since we're using the streaming API, though,
+                            # where text Parts may be split across multiple
+                            # chunks (each represented by a Part, confusingly),
+                            # signatures may actually appear with the first
+                            # chunk (Gemini 2.5) or in a trailing empty-text
+                            # chunk (Gemini 3 Pro).
+                            if part.thought_signature:
+                                # Save a "bookmark" for the signature, so we
+                                # can later be sure we've put it in the right
+                                # place in context when sending the context
+                                # back to the LLM to continue the conversation.
+                                bookmark = {}
+                                if part.function_call:
+                                    bookmark["function_call"] = function_call_id
+                                elif part.inline_data and part.inline_data.data:
+                                    bookmark["inline_data"] = part.inline_data
+                                elif part.text is not None:
+                                    # Account for Gemini 3 Pro trailing
+                                    # empty-text chunk by using all the text
+                                    # seen so far in this response's chunks.
+                                    bookmark["text"] = accumulated_text
+                                else:
+                                    logger.warning("Thought signature found on unhandled Part type")
+                                if bookmark:
+                                    await self.push_frame(
+                                        LLMMessagesAppendFrame(
+                                            [
+                                                self.get_llm_adapter().create_llm_specific_message(
+                                                    {
+                                                        "type": "thought_signature",
+                                                        "signature": part.thought_signature,
+                                                        "bookmark": bookmark,
+                                                    }
+                                                )
+                                            ]
+                                        )
+                                    )
 
                     if (
                             candidate.grounding_metadata
@@ -982,11 +1195,11 @@ class GoogleLLMService(LLMService):
         except DeadlineExceeded:
             await self._call_event_handler("on_completion_timeout")
         except Exception as e:
-            logger.exception(f"{self} exception: {e}")
+            await self.push_error(error_msg=f"Unknown error occurred: {e}", exception=e)
         finally:
             if grounding_metadata and isinstance(grounding_metadata, dict):
                 llm_search_frame = LLMSearchResponseFrame(
-                    search_result=search_result,
+                    search_result=accumulated_text,
                     origins=grounding_metadata["origins"],
                     rendered_content=grounding_metadata["rendered_content"],
                 )
@@ -1023,13 +1236,28 @@ class GoogleLLMService(LLMService):
             # NOTE: LLMMessagesFrame is deprecated, so we don't support the newer universal
             # LLMContext with it
             context = GoogleLLMContext(frame.messages)
-        elif isinstance(frame, LLMUpdateSettingsFrame):
-            await self._update_settings(frame.settings)
         else:
             await self.push_frame(frame, direction)
 
         if context:
             await self._process_context(context)
+
+    async def stop(self, frame):
+        """Override stop to gracefully close the client."""
+        await super().stop(frame)
+        await self._close_client()
+
+    async def cancel(self, frame):
+        """Override cancel to gracefully close the client."""
+        await super().cancel(frame)
+        await self._close_client()
+
+    async def _close_client(self):
+        try:
+            await self._client.aio.aclose()
+        except Exception:
+            # Do nothing - we're shutting down anyway
+            pass
 
     def create_context_aggregator(
             self,
@@ -1053,11 +1281,18 @@ class GoogleLLMService(LLMService):
             the user and one for the assistant, encapsulated in an
             GoogleContextAggregatorPair.
 
+        .. deprecated:: 0.0.99
+            `create_context_aggregator()` is deprecated and will be removed in a future version.
+            Use the universal `LLMContext` and `LLMContextAggregatorPair` instead.
+            See `OpenAILLMContext` docstring for migration guide.
         """
         context.set_llm_adapter(self.get_llm_adapter())
 
         if isinstance(context, OpenAILLMContext):
             context = GoogleLLMContext.upgrade_to_google(context)
+
+        # Aggregators handle deprecation warnings
         user = GoogleUserContextAggregator(context, params=user_params)
         assistant = GoogleAssistantContextAggregator(context, params=assistant_params)
+
         return GoogleContextAggregatorPair(_user=user, _assistant=assistant)

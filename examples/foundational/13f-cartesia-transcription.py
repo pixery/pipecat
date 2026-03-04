@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2024–2025, Daily
+# Copyright (c) 2024-2026, Daily
 #
 # SPDX-License-Identifier: BSD 2-Clause License
 #
@@ -35,9 +35,8 @@ class TranscriptionLogger(FrameProcessor):
         await self.push_frame(frame, direction)
 
 
-# We store functions so objects (e.g. SileroVADAnalyzer) don't get
-# instantiated. The function will be called when the desired transport gets
-# selected.
+# We use lambdas to defer transport parameter creation until the transport
+# type is selected at runtime.
 transport_params = {
     "daily": lambda: DailyParams(audio_in_enabled=True),
     "twilio": lambda: FastAPIWebsocketParams(audio_in_enabled=True),
@@ -48,10 +47,7 @@ transport_params = {
 async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     logger.info(f"Starting bot")
 
-    stt = CartesiaSTTService(
-        api_key=os.getenv("CARTESIA_API_KEY"),
-        base_url=os.getenv("CARTESIA_BASE_URL"),
-    )
+    stt = CartesiaSTTService(api_key=os.getenv("CARTESIA_API_KEY"))
 
     tl = TranscriptionLogger()
 

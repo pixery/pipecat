@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2024–2025, Daily
+# Copyright (c) 2024-2026, Daily
 #
 # SPDX-License-Identifier: BSD 2-Clause License
 #
@@ -7,7 +7,8 @@
 """LMNT text-to-speech service implementation."""
 
 import json
-from typing import AsyncGenerator, Optional
+from dataclasses import dataclass, field
+from typing import Any, AsyncGenerator, Optional
 
 from loguru import logger
 
@@ -23,8 +24,9 @@ from pipecat.frames.frames import (
     TTSStoppedFrame,
 )
 from pipecat.processors.frame_processor import FrameDirection
+from pipecat.services.settings import NOT_GIVEN, TTSSettings, _NotGiven
 from pipecat.services.tts_service import InterruptibleTTSService
-from pipecat.transcriptions.language import Language
+from pipecat.transcriptions.language import Language, resolve_language
 from pipecat.utils.tracing.service_decorators import traced_tts
 
 # See .env.example for LMNT configuration needed
@@ -46,7 +48,7 @@ def language_to_lmnt_language(language: Language) -> Optional[str]:
     Returns:
         The corresponding LMNT language code, or None if not supported.
     """
-    BASE_LANGUAGES = {
+    LANGUAGE_MAP = {
         Language.DE: "de",
         Language.EN: "en",
         Language.ES: "es",
@@ -68,17 +70,18 @@ def language_to_lmnt_language(language: Language) -> Optional[str]:
         Language.ZH: "zh",
     }
 
-    result = BASE_LANGUAGES.get(language)
+    return resolve_language(language, LANGUAGE_MAP, use_base_code=True)
 
-    # If not found in base languages, try to find the base language from a variant
-    if not result:
-        # Convert enum value to string and get the base language part (e.g. es-ES -> es)
-        lang_str = str(language.value)
-        base_code = lang_str.split("-")[0].lower()
-        # Look up the base code in our supported languages
-        result = base_code if base_code in BASE_LANGUAGES.values() else None
 
-    return result
+@dataclass
+class LmntTTSSettings(TTSSettings):
+    """Settings for LMNT TTS service.
+
+    Parameters:
+        format: Audio output format. Defaults to "raw".
+    """
+
+    format: str | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
 
 
 class LmntTTSService(InterruptibleTTSService):
@@ -88,6 +91,8 @@ class LmntTTSService(InterruptibleTTSService):
     Supports streaming audio generation with configurable voice models and
     language settings.
     """
+
+    _settings: LmntTTSSettings
 
     def __init__(
         self,
@@ -113,18 +118,18 @@ class LmntTTSService(InterruptibleTTSService):
             push_stop_frames=True,
             pause_frame_processing=True,
             sample_rate=sample_rate,
+            settings=LmntTTSSettings(
+                model=model,
+                voice=voice_id,
+                language=self.language_to_service_language(language),
+                format="raw",
+            ),
             **kwargs,
         )
 
         self._api_key = api_key
-        self.set_voice(voice_id)
-        self.set_model_name(model)
-        self._settings = {
-            "language": self.language_to_service_language(language),
-            "format": "raw",  # Use raw format for direct PCM data
-        }
-        self._started = False
         self._receive_task = None
+        self._context_id: Optional[str] = None
 
     def can_generate_metrics(self) -> bool:
         """Check if this service can generate processing metrics.
@@ -180,11 +185,11 @@ class LmntTTSService(InterruptibleTTSService):
             direction: The direction to push the frame.
         """
         await super().push_frame(frame, direction)
-        if isinstance(frame, (TTSStoppedFrame, InterruptionFrame)):
-            self._started = False
 
     async def _connect(self):
         """Connect to LMNT WebSocket and start receive task."""
+        await super()._connect()
+
         await self._connect_websocket()
 
         if self._websocket and not self._receive_task:
@@ -192,11 +197,30 @@ class LmntTTSService(InterruptibleTTSService):
 
     async def _disconnect(self):
         """Disconnect from LMNT WebSocket and clean up tasks."""
+        await super()._disconnect()
+
         if self._receive_task:
             await self.cancel_task(self._receive_task)
             self._receive_task = None
 
         await self._disconnect_websocket()
+
+    async def _update_settings(self, delta: TTSSettings) -> dict[str, Any]:
+        """Apply a settings delta.
+
+        Args:
+            delta: A :class:`TTSSettings` (or ``LmntTTSSettings``) delta.
+
+        Returns:
+            Dict mapping changed field names to their previous values.
+        """
+        changed = await super()._update_settings(delta)
+
+        if changed:
+            await self._disconnect()
+            await self._connect()
+
+        return changed
 
     async def _connect_websocket(self):
         """Connect to LMNT websocket."""
@@ -209,11 +233,11 @@ class LmntTTSService(InterruptibleTTSService):
             # Build initial connection message
             init_msg = {
                 "X-API-Key": self._api_key,
-                "voice": self._voice_id,
-                "format": self._settings["format"],
+                "voice": self._settings.voice,
+                "format": self._settings.format,
                 "sample_rate": self.sample_rate,
-                "language": self._settings["language"],
-                "model": self.model_name,
+                "language": self._settings.language,
+                "model": self._settings.model,
             }
 
             # Connect to LMNT's websocket directly
@@ -222,8 +246,9 @@ class LmntTTSService(InterruptibleTTSService):
             # Send initialization message
             await self._websocket.send(json.dumps(init_msg))
 
+            await self._call_event_handler("on_connected")
         except Exception as e:
-            logger.error(f"{self} initialization error: {e}")
+            await self.push_error(error_msg=f"Unknown error occurred: {e}", exception=e)
             self._websocket = None
             await self._call_event_handler("on_connection_error", f"{e}")
 
@@ -239,10 +264,11 @@ class LmntTTSService(InterruptibleTTSService):
                 # await self._websocket.send(json.dumps({"eof": True}))
                 await self._websocket.close()
         except Exception as e:
-            logger.error(f"{self} error closing websocket: {e}")
+            await self.push_error(error_msg=f"Error disconnecting from LMNT: {e}", exception=e)
         finally:
-            self._started = False
+            self._context_id = None
             self._websocket = None
+            await self._call_event_handler("on_disconnected")
 
     def _get_websocket(self):
         """Get the WebSocket connection if available."""
@@ -266,26 +292,27 @@ class LmntTTSService(InterruptibleTTSService):
                     audio=message,
                     sample_rate=self.sample_rate,
                     num_channels=1,
+                    context_id=self._context_id,
                 )
                 await self.push_frame(frame)
             else:
                 try:
                     msg = json.loads(message)
                     if "error" in msg:
-                        logger.error(f"{self} error: {msg['error']}")
                         await self.push_frame(TTSStoppedFrame())
                         await self.stop_all_metrics()
-                        await self.push_error(ErrorFrame(f"{self} error: {msg['error']}"))
+                        await self.push_error(error_msg=f"Error: {msg['error']}")
                         return
                 except json.JSONDecodeError:
                     logger.error(f"Invalid JSON message: {message}")
 
     @traced_tts
-    async def run_tts(self, text: str) -> AsyncGenerator[Frame, None]:
+    async def run_tts(self, text: str, context_id: str) -> AsyncGenerator[Frame, None]:
         """Generate TTS audio from text using LMNT's streaming API.
 
         Args:
             text: The text to synthesize into speech.
+            context_id: The context ID for tracking audio frames.
 
         Yields:
             Frame: Audio frames containing the synthesized speech.
@@ -297,10 +324,10 @@ class LmntTTSService(InterruptibleTTSService):
                 await self._connect()
 
             try:
-                if not self._started:
-                    await self.start_ttfb_metrics()
-                    yield TTSStartedFrame()
-                    self._started = True
+                await self.start_ttfb_metrics()
+                # Store context_id for use in _receive_messages
+                self._context_id = context_id
+                yield TTSStartedFrame(context_id=context_id)
 
                 # Send text to LMNT
                 await self._get_websocket().send(json.dumps({"text": text}))
@@ -308,11 +335,11 @@ class LmntTTSService(InterruptibleTTSService):
                 await self._get_websocket().send(json.dumps({"flush": True}))
                 await self.start_tts_usage_metrics(text)
             except Exception as e:
-                logger.error(f"{self} error sending message: {e}")
-                yield TTSStoppedFrame()
+                yield ErrorFrame(error=f"Unknown error occurred: {e}")
+                yield TTSStoppedFrame(context_id=context_id)
                 await self._disconnect()
                 await self._connect()
                 return
             yield None
         except Exception as e:
-            logger.error(f"{self} exception: {e}")
+            yield ErrorFrame(error=f"Unknown error occurred: {e}")
