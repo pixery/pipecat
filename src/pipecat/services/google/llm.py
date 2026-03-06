@@ -41,7 +41,7 @@ from pipecat.frames.frames import (
     LLMThoughtTextFrame,
 )
 from pipecat.metrics.metrics import LLMTokenUsage
-from pipecat.processors.aggregators.llm_context import LLMContext
+from pipecat.processors.aggregators.llm_context import LLMContext, LLMSpecificMessage
 from pipecat.processors.aggregators.llm_response import (
     LLMAssistantAggregatorParams,
     LLMUserAggregatorParams,
@@ -303,6 +303,8 @@ class GoogleLLMContext(OpenAILLMContext):
             if isinstance(msg, Content):
                 # Already in Gemini format
                 converted_messages.append(msg)
+            elif isinstance(msg, LLMSpecificMessage):
+                continue
             else:
                 # Convert from standard format to Gemini format
                 converted = self.from_standard_message(msg)
@@ -649,6 +651,9 @@ class GoogleLLMContext(OpenAILLMContext):
             if isinstance(message, Content):
                 # Keep existing Google-formatted messages (e.g., function calls/responses)
                 converted_messages.append(message)
+                continue
+
+            if isinstance(message, LLMSpecificMessage):
                 continue
 
             # Convert OpenAI format to Google format, system messages return None

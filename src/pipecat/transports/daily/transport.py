@@ -1058,6 +1058,9 @@ class DailyTransportClient(EventHandler):
         if not self._token:
             return "Transcription can't be stopped without a room token"
 
+        if not self._transcription_status:
+            return None
+
         future = self._get_event_loop().create_future()
         self._client.stop_transcription(completion=completion_callback(future))
         return await future
@@ -1457,6 +1460,7 @@ class DailyTransportClient(EventHandler):
             stopped_by_error: Whether stopped due to error.
         """
         logger.debug("Transcription stopped")
+        self._transcription_status = None
         self._call_event_callback(
             self._callbacks.on_transcription_stopped, stopped_by, stopped_by_error
         )

@@ -51,6 +51,7 @@ from pipecat.services.tts_service import (
     TTSService,
 )
 from pipecat.transcriptions.language import Language, resolve_language
+from pipecat.utils.network import exponential_backoff_time
 from pipecat.utils.tracing.service_decorators import traced_tts
 
 # See .env.example for ElevenLabs configuration needed
@@ -610,47 +611,61 @@ class ElevenLabsTTSService(AudioContextTTSService):
 
         await self._disconnect_websocket()
 
-    async def _connect_websocket(self):
-        try:
-            if self._websocket and self._websocket.state is State.OPEN:
-                return
+    async def _connect_websocket(self, max_retries: int = 3):
+        if self._websocket and self._websocket.state is State.OPEN:
+            return
 
-            logger.debug("Connecting to ElevenLabs")
+        voice_id = self._settings.voice
+        model = self._settings.model
+        output_format = self._output_format
+        url = f"{self._url}/v1/text-to-speech/{voice_id}/multi-stream-input?model_id={model}&output_format={output_format}&auto_mode={self._settings.auto_mode}"
 
-            voice_id = self._settings.voice
-            model = self._settings.model
-            output_format = self._output_format
-            url = f"{self._url}/v1/text-to-speech/{voice_id}/multi-stream-input?model_id={model}&output_format={output_format}&auto_mode={self._settings.auto_mode}"
+        if self._settings.enable_ssml_parsing:
+            url += f"&enable_ssml_parsing={self._settings.enable_ssml_parsing}"
 
-            if self._settings.enable_ssml_parsing:
-                url += f"&enable_ssml_parsing={self._settings.enable_ssml_parsing}"
+        if self._settings.enable_logging:
+            url += f"&enable_logging={self._settings.enable_logging}"
 
-            if self._settings.enable_logging:
-                url += f"&enable_logging={self._settings.enable_logging}"
+        if self._settings.apply_text_normalization is not None:
+            url += f"&apply_text_normalization={self._settings.apply_text_normalization}"
 
-            if self._settings.apply_text_normalization is not None:
-                url += f"&apply_text_normalization={self._settings.apply_text_normalization}"
-
-            # Language can only be used with the ELEVENLABS_MULTILINGUAL_MODELS
-            language = self._settings.language
-            if model in ELEVENLABS_MULTILINGUAL_MODELS and language is not None:
-                url += f"&language_code={language}"
-                logger.debug(f"Using language code: {language}")
-            elif language is not None:
-                logger.warning(
-                    f"Language code [{language}] not applied. Language codes can only be used with multilingual models: {', '.join(sorted(ELEVENLABS_MULTILINGUAL_MODELS))}"
-                )
-
-            # Set max websocket message size to 16MB for large audio responses
-            self._websocket = await websocket_connect(
-                url, max_size=16 * 1024 * 1024, additional_headers={"xi-api-key": self._api_key}
+        # Language can only be used with the ELEVENLABS_MULTILINGUAL_MODELS
+        language = self._settings.language
+        if model in ELEVENLABS_MULTILINGUAL_MODELS and language is not None:
+            url += f"&language_code={language}"
+            logger.debug(f"Using language code: {language}")
+        elif language is not None:
+            logger.warning(
+                f"Language code [{language}] not applied. Language codes can only be used with multilingual models: {', '.join(sorted(ELEVENLABS_MULTILINGUAL_MODELS))}"
             )
 
-            await self._call_event_handler("on_connected")
-        except Exception as e:
-            self._websocket = None
-            await self.push_error(error_msg=f"Unknown error occurred: {e}", exception=e)
-            await self._call_event_handler("on_connection_error", f"{e}")
+        last_exception = None
+        for attempt in range(1, max_retries + 1):
+            try:
+                logger.debug(f"Connecting to ElevenLabs (attempt {attempt})")
+                # Set max websocket message size to 16MB for large audio responses
+                self._websocket = await websocket_connect(
+                    url,
+                    max_size=16 * 1024 * 1024,
+                    additional_headers={"xi-api-key": self._api_key},
+                )
+                await self._call_event_handler("on_connected")
+                return
+            except Exception as e:
+                last_exception = e
+                self._websocket = None
+                if attempt < max_retries:
+                    wait_time = exponential_backoff_time(attempt)
+                    logger.warning(
+                        f"ElevenLabs connection attempt {attempt} failed: {e}, retrying in {wait_time:.1f}s"
+                    )
+                    await asyncio.sleep(wait_time)
+
+        await self.push_error(
+            error_msg=f"Failed to connect to ElevenLabs after {max_retries} attempts: {last_exception}",
+            exception=last_exception,
+        )
+        await self._call_event_handler("on_connection_error", f"{last_exception}")
 
     async def _disconnect_websocket(self):
         try:
@@ -658,8 +673,7 @@ class ElevenLabsTTSService(AudioContextTTSService):
 
             if self._websocket:
                 logger.debug("Disconnecting from ElevenLabs")
-                # Close all contexts and the socket
-                if self.has_active_audio_context():
+                if self.has_active_audio_context() and self._websocket.state is State.OPEN:
                     await self._websocket.send(json.dumps({"close_socket": True}))
                 await self._websocket.close()
                 logger.debug("Disconnected from ElevenLabs")
